@@ -1,0 +1,19 @@
+{
+  "name": "techweek-slackbot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "테크위크 스케줄 관리 슬랙 봇 (Claude 기반 파싱 + Postgres 저장)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "@slack/bolt": "^4.6.0",
+    "dotenv": "^17.2.3",
+    "pg": "^8.16.3"
+  }
+}
