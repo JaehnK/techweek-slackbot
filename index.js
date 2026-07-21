@@ -17,7 +17,7 @@ if (missingEnv.length) {
   process.exit(1);
 }
 
-const MAX_INPUT_LENGTH = 20000;
+const MAX_INPUT_LENGTH = 50000; // Luma 메인 페이지 전체 복붙(여러 주 분량)까지 허용
 const CLAUDE_MODEL = 'claude-haiku-4-5';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -102,15 +102,32 @@ const EVENT_LIST_SCHEMA = {
   additionalProperties: false,
 };
 
+function buildParsePrompt(text) {
+  return `다음은 Luma 캘린더 메인 페이지 전체를 복사한 텍스트야. 여기 있는 모든 이벤트를 추출해줘.
+
+주의할 점:
+1. 시간 표기: 각 이벤트 줄에는 시간이 두 번 나올 수 있어. 예: "오전 7:30 · 7월 27일 오후 3:30 GMT-7"
+   - 앞의 시간(타임존 표기 없음)은 보는 사람 로컬 시간이니 무시해.
+   - "GMT±N" 같은 타임존이 붙은 뒤쪽 날짜/시간이 이벤트 실제 현지 시각이야. event_date/event_time에는 이 값을 사용해.
+   - 만약 타임존 표기가 붙은 시간이 없다면, 날짜 섹션 헤더(예: "7월 28일 화요일")와 그 아래 있는 시간을 사용해.
+2. "이벤트 만들기", "탐색", "가격", "도움말" 같은 네비게이션 문구, "...의 커버 이미지" 같은 이미지 설명, "+39" 같은 참석자 수 표시는 이벤트 정보가 아니니 무시해.
+3. 호스트가 여러 명이면("&", "외 N 명" 등) 있는 그대로 host 필드에 담아.
+4. status는 원문에 보이는 그대로 사용해 (예: 참석, 승인 대기 중).
+5. 페이지에 luma_url(링크)이 보이지 않으면 luma_url은 null로 둬.
+
+텍스트:
+${text}`;
+}
+
 async function parseWithClaude(text) {
   const response = await anthropic.messages.create({
     model: CLAUDE_MODEL,
-    max_tokens: 4096,
+    max_tokens: 8192,
     output_config: { format: { type: 'json_schema', schema: EVENT_LIST_SCHEMA } },
     messages: [
       {
         role: 'user',
-        content: `다음은 Luma 페이지에서 복사한 텍스트야. 이 안에 있는 테크위크 이벤트들을 추출해줘.\n\n텍스트:\n${text}`,
+        content: buildParsePrompt(text),
       },
     ],
   });
@@ -149,10 +166,19 @@ async function upsertAll(slackUserId, events) {
     );
     const eventId = eventRes.rows[0].id;
 
+    // '참석'으로 확정된 신청을, 오래된 붙여넣기로 인해 '승인 대기 중'으로 되돌리지 않도록 방지
     await pool.query(
       `INSERT INTO applications (student_id, event_id, status)
        VALUES ($1,$2,$3)
-       ON CONFLICT (student_id, event_id) DO UPDATE SET status = EXCLUDED.status, created_at = now()`,
+       ON CONFLICT (student_id, event_id) DO UPDATE SET
+         status = CASE
+           WHEN applications.status = '참석' AND EXCLUDED.status = '승인 대기 중' THEN applications.status
+           ELSE EXCLUDED.status
+         END,
+         created_at = CASE
+           WHEN applications.status = '참석' AND EXCLUDED.status = '승인 대기 중' THEN applications.created_at
+           ELSE now()
+         END`,
       [studentId, eventId, ev.status || '알수없음']
     );
   }
