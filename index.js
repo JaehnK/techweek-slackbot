@@ -26,6 +26,17 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
+  // Railway 헬스체크용 GET /health (Bolt v4 기본 HTTPReceiver의 customRoutes)
+  customRoutes: [
+    {
+      path: '/health',
+      method: ['GET'],
+      handler: (req, res) => {
+        res.writeHead(200);
+        res.end('ok');
+      },
+    },
+  ],
 });
 
 // ---------- 1. 스키마 초기화 ----------
@@ -255,9 +266,7 @@ app.command('/my-events', async ({ command, ack, respond }) => {
   await respond(text);
 });
 
-// ---------- 6. 헬스체크 + 실행 ----------
-app.receiver.app.get('/health', (req, res) => res.send('ok'));
-
+// ---------- 6. 실행 ----------
 (async () => {
   await initSchema();
   await app.start(process.env.PORT || 3000);
