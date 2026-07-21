@@ -27,9 +27,58 @@ npm start
 5. **Basic Information**에서 Signing Secret 확인 → `SLACK_SIGNING_SECRET`
 6. 앱을 워크스페이스에 설치 후 Bot User OAuth Token(`xoxb-...`) 확인 → `SLACK_BOT_TOKEN`
 
-## Railway 배포 준비 (GitHub 연동 방식)
+## 배포 현황 (Railway)
 
-이 저장소는 GitHub에 푸시해서 Railway와 연동하는 것을 전제로 준비되어 있다. 아래는 실제 배포 시 진행할 단계 (직접 실행은 하지 않음):
+Railway CLI로 배포 완료.
+
+- **프로젝트**: `techweek-slackbot` (Railway)
+- **서비스**: `techweek-app`(앱) + `Postgres`(DB)
+- **공개 도메인**: https://techweek-app-production.up.railway.app
+- **환경변수**: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `ANTHROPIC_API_KEY`는 CLI로 설정됨. `DATABASE_URL`은 `${{Postgres.DATABASE_URL}}` 참조로 연결(내부 네트워크). `PORT`는 Railway가 자동 주입.
+- **빌드**: Railway가 `package.json` 감지 → `npm install` → `npm start`.
+
+### ⚠️ 남은 작업 — 유효한 Slack 토큰 필요
+
+현재 앱은 빌드·DB 연결·스키마 생성까지 정상이지만, `SLACK_BOT_TOKEN`이 유효하지 않아 기동 직후 Slack `invalid_auth`로 크래시-루프 중이다. 아래를 완료하면 정상 상주한다:
+
+1. api.slack.com/apps에서 앱을 만들고 워크스페이스에 설치해 **유효한 Bot User OAuth Token(`xoxb-...`)** 확보
+2. 토큰 교체 (값이 로그에 안 남게 stdin으로):
+   ```bash
+   printf '%s' 'xoxb-실제토큰' | railway variable set --service techweek-app --stdin SLACK_BOT_TOKEN
+   ```
+   `SLACK_SIGNING_SECRET`도 같은 방식으로 실제 값인지 확인/교체.
+3. Slack 앱 설정에서 **Event Subscriptions**(`message.im`)와 **Slash Commands**(`/events`, `/event-stats`, `/my-events`)의 Request URL을 아래로 지정:
+   `https://techweek-app-production.up.railway.app/slack/events`
+4. `GET https://techweek-app-production.up.railway.app/health` → `ok` 확인 후 DM 테스트
+
+### 참고 — CLI로 처음부터 다시 배포하는 절차
+
+```bash
+railway init --name techweek-slackbot     # 프로젝트 생성 + 디렉토리 링크
+railway add --database postgres            # Postgres 추가
+railway add --service techweek-app         # 앱 서비스 생성
+# 시크릿(stdin) + DB 참조 변수 설정
+printf '%s' "$SLACK_BOT_TOKEN"      | railway variable set -s techweek-app --skip-deploys --stdin SLACK_BOT_TOKEN
+printf '%s' "$SLACK_SIGNING_SECRET" | railway variable set -s techweek-app --skip-deploys --stdin SLACK_SIGNING_SECRET
+printf '%s' "$ANTHROPIC_API_KEY"    | railway variable set -s techweek-app --skip-deploys --stdin ANTHROPIC_API_KEY
+railway variable set -s techweek-app --skip-deploys 'DATABASE_URL=${{Postgres.DATABASE_URL}}'
+railway up --service techweek-app          # 로컬 디렉토리 업로드 → 빌드/배포
+railway domain --service techweek-app      # 공개 도메인 발급
+```
+
+> `.env`와 `node_modules`는 `.gitignore`에 있어 `railway up` 업로드에서 자동 제외된다 (시크릿은 Railway 환경변수로만 관리).
+
+<details>
+<summary>대안: GitHub 연동 방식 (dashboard)</summary>
+
+1. GitHub 저장소에 push (이미 완료: https://github.com/JaehnK/techweek-slackbot)
+2. [railway.app](https://railway.app) → New Project → **Deploy from GitHub repo** → 저장소 선택
+3. Postgres 플러그인 추가, 위와 동일한 환경변수 설정
+4. push할 때마다 자동 재배포
+</details>
+
+<details>
+<summary>(구) 수동 배포 단계 메모</summary>
 
 1. GitHub에 새 저장소 생성 후 이 프로젝트 push
    ```bash
@@ -46,6 +95,8 @@ npm start
 5. Railway가 Nixpacks로 `package.json`을 감지해 `npm install` → `npm start`로 빌드/실행 (별도 설정 파일 불필요)
 6. 배포 후 발급되는 공개 도메인(`https://<app>.up.railway.app`)을 Slack 앱의 Event Subscriptions / Slash Commands Request URL에 등록
 7. `/health`로 정상 기동 확인 후 DM 테스트
+
+</details>
 
 ## 알아둘 점
 
