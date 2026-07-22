@@ -221,16 +221,26 @@ app.message(async ({ message, say }) => {
 });
 
 // ---------- 5. 슬래시 커맨드 (전체 공개 조회) ----------
+// event_date/event_time은 쿼리에서 TO_CHAR로 문자열화됨. 날짜 없으면 '미정', 시간 있으면 뒤에 붙임.
+function fmtWhen(r) {
+  const date = r.event_date || '미정';
+  return r.event_time ? `${date} ${r.event_time}` : date;
+}
+
 app.command('/events', async ({ ack, respond }) => {
   await ack();
   const res = await pool.query(`
-    SELECT s.name, e.title, e.event_date, a.status
+    SELECT s.name,
+           e.title,
+           TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+           TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
+           a.status
     FROM applications a
     JOIN events e ON e.id = a.event_id
     JOIN students s ON s.id = a.student_id
-    ORDER BY e.event_date, s.name
+    ORDER BY e.event_date, e.event_time, s.name
   `);
-  const text = res.rows.map((r) => `${r.event_date} | ${r.title} — ${r.name} (${r.status})`).join('\n')
+  const text = res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — <@${r.name}> (${r.status})`).join('\n')
     || '신청 내역이 없습니다.';
   await respond({ text, response_type: 'in_channel' });
 });
@@ -238,14 +248,17 @@ app.command('/events', async ({ ack, respond }) => {
 app.command('/event-stats', async ({ ack, respond }) => {
   await ack();
   const res = await pool.query(`
-    SELECT e.title, e.event_date, COUNT(*) AS total,
+    SELECT e.title,
+           TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+           TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
+           COUNT(*) AS total,
            COUNT(*) FILTER (WHERE a.status = '승인 대기 중') AS pending
     FROM applications a
     JOIN events e ON e.id = a.event_id
-    GROUP BY e.id, e.title, e.event_date
-    ORDER BY e.event_date
+    GROUP BY e.id, e.title, e.event_date, e.event_time
+    ORDER BY e.event_date, e.event_time
   `);
-  const text = res.rows.map((r) => `${r.event_date} | ${r.title} — 총 ${r.total}명 (대기 ${r.pending})`).join('\n')
+  const text = res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — 총 ${r.total}명 (대기 ${r.pending})`).join('\n')
     || '이벤트가 없습니다.';
   await respond({ text, response_type: 'in_channel' });
 });
@@ -253,15 +266,18 @@ app.command('/event-stats', async ({ ack, respond }) => {
 app.command('/my-events', async ({ command, ack, respond }) => {
   await ack();
   const res = await pool.query(
-    `SELECT e.title, e.event_date, a.status
+    `SELECT e.title,
+            TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+            TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
+            a.status
      FROM applications a
      JOIN events e ON e.id = a.event_id
      JOIN students s ON s.id = a.student_id
      WHERE s.name = $1
-     ORDER BY e.event_date`,
+     ORDER BY e.event_date, e.event_time`,
     [command.user_id]
   );
-  const text = res.rows.map((r) => `${r.event_date} | ${r.title} — ${r.status}`).join('\n')
+  const text = res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — ${r.status}`).join('\n')
     || '신청 내역이 없습니다.';
   await respond(text);
 });
