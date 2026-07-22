@@ -109,7 +109,9 @@ async function parseWithClaude(text) {
   return parsed.events;
 }
 
-// ---------- 3. DB upsert (무조건 덮어쓰기) ----------
+// ---------- 3. DB upsert + 예정 일정 동기화 ----------
+// 붙여넣기를 '그 시점의 예정 일정 전체'로 보고, 빠진 예정 일정은 취소된 것으로 간주해 지운다.
+// 지난 일정은 참석 기록이므로 건드리지 않는다 (Luma '예정된' 탭엔 미래만 나오기 때문).
 async function upsertAll(slackUserId, events) {
   const studentRes = await pool.query(
     `INSERT INTO students (name) VALUES ($1)
@@ -117,6 +119,7 @@ async function upsertAll(slackUserId, events) {
     [slackUserId]
   );
   const studentId = studentRes.rows[0].id;
+  const touchedEventIds = [];
 
   for (const ev of events) {
     // 중복 키는 항상 제목+날짜에서 만든다. luma_url은 붙여넣기마다 있을 수도, 없을 수도 있어
@@ -136,6 +139,7 @@ async function upsertAll(slackUserId, events) {
        ev.luma_url || null, key]
     );
     const eventId = eventRes.rows[0].id;
+    touchedEventIds.push(eventId);
 
     // '참석'으로 확정된 신청을, 오래된 붙여넣기로 인해 '승인 대기 중'으로 되돌리지 않도록 방지
     await pool.query(
@@ -153,6 +157,28 @@ async function upsertAll(slackUserId, events) {
       [studentId, eventId, ev.status || '알수없음']
     );
   }
+
+  // 빈 파싱 결과로 기존 일정을 통째로 날리지 않도록 방어 (호출부에서도 막지만 이중 안전장치)
+  if (!touchedEventIds.length) return { saved: 0, removed: 0, removedTitles: [] };
+
+  // 이번 붙여넣기에 없는 '예정' 일정 = 취소된 것으로 보고 제거.
+  // 서버는 UTC, 행사는 시애틀(UTC-7)이라 경계에서 하루 밀릴 수 있어 1일 여유를 둔다.
+  const del = await pool.query(
+    `DELETE FROM applications a
+     USING events e
+     WHERE a.event_id = e.id
+       AND a.student_id = $1
+       AND NOT (a.event_id = ANY($2::int[]))
+       AND (e.event_date IS NULL OR e.event_date >= CURRENT_DATE - INTERVAL '1 day')
+     RETURNING e.title`,
+    [studentId, touchedEventIds]
+  );
+
+  return {
+    saved: touchedEventIds.length,
+    removed: del.rowCount,
+    removedTitles: del.rows.map((r) => r.title),
+  };
 }
 
 // ---------- 4. DM 수신 → 파싱 → 저장 ----------
@@ -172,8 +198,14 @@ app.message(async ({ message, say }) => {
       await say('파싱된 이벤트가 없어요. 텍스트를 확인해주세요.');
       return;
     }
-    await upsertAll(message.user, parsed);
-    await say(`✅ ${parsed.length}개 이벤트 저장 완료!`);
+    const { saved, removed, removedTitles } = await upsertAll(message.user, parsed);
+    // 제거된 항목은 반드시 알려준다. 일부만 복사해 보냈을 때 본인이 바로 알아채야 하므로.
+    const removedNote = removed
+      ? `\n🗑 취소된 일정 ${removed}개 제거:\n`
+        + removedTitles.map((t) => `  · ${t}`).join('\n')
+        + `\n(의도한 게 아니라면 Luma 페이지 전체를 다시 복사해 보내주세요.)`
+      : '';
+    await say(`✅ ${saved}개 이벤트 저장 완료!${removedNote}`);
   } catch (err) {
     console.error(err);
     await say('⚠️ 처리 중 오류가 발생했어요.');
