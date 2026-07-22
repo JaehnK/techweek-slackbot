@@ -78,11 +78,11 @@ Fluke Hall, University of Washington
 
 // GMT-7 표기 기준 기대값 (행사 현지시각)
 const EXPECTED = [
-  { t: "What's Space", date: '2026-07-27', time: '15:30', status: '참석' },
-  { t: 'Creativity',   date: '2026-07-27', time: '18:00', status: '참석' },
-  { t: 'Scaling',      date: '2026-07-28', time: '11:00', status: '승인 대기 중' },
-  { t: 'TwelveLabs',   date: '2026-07-28', time: '17:30', status: '참석' },
-  { t: 'Tech BBQ',     date: '2026-07-29', time: '15:00', status: '참석' },
+  { t: "What's Space", date: '2026-07-27', time: '15:30', status: 'Going' },
+  { t: 'Creativity',   date: '2026-07-27', time: '18:00', status: 'Going' },
+  { t: 'Scaling',      date: '2026-07-28', time: '11:00', status: 'Pending approval' },
+  { t: 'TwelveLabs',   date: '2026-07-28', time: '17:30', status: 'Going' },
+  { t: 'Tech BBQ',     date: '2026-07-29', time: '15:00', status: 'Going' },
 ];
 
 (async () => {

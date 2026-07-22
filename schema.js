@@ -31,13 +31,13 @@ async function initSchema(pool) {
       UNIQUE (student_id, event_id)
     );
 
-    -- pending_count는 '아직 참석 확정이 아닌' 신청 수. 특정 상태('승인 대기 중')를 하드코딩하면
-    -- Luma에 새 상태(예: '대기자 명단')가 생길 때 조용히 누락되므로 '참석'이 아닌 것을 센다.
+    -- pending_count는 '아직 참석 확정이 아닌' 신청 수. 특정 대기 상태를 하드코딩하면
+    -- Luma에 새 상태가 생길 때 조용히 누락되므로 'Going'이 아닌 것을 센다.
     CREATE OR REPLACE FUNCTION update_student_counts() RETURNS TRIGGER AS $$
     BEGIN
       UPDATE students SET
         application_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id)),
-        pending_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id) AND status <> '참석')
+        pending_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id) AND status <> 'Going')
       WHERE id = COALESCE(NEW.student_id, OLD.student_id);
       RETURN NULL;
     END;
@@ -50,6 +50,7 @@ async function initSchema(pool) {
   `);
 
   await migrateDedupKey(pool);
+  await migrateStatusesToEnglish(pool);
 
   // 트리거 함수가 바뀌어도 기존 행은 다음 변경 때까지 옛 값이 남으므로 즉시 재계산한다.
   await pool.query(`
@@ -59,7 +60,7 @@ async function initSchema(pool) {
     FROM (
       SELECT st.id,
              COUNT(a.id)                                   AS total,
-             COUNT(a.id) FILTER (WHERE a.status <> '참석')  AS pending
+             COUNT(a.id) FILTER (WHERE a.status <> 'Going') AS pending
       FROM students st LEFT JOIN applications a ON a.student_id = st.id
       GROUP BY st.id
     ) x
@@ -132,4 +133,21 @@ async function migrateDedupKey(pool) {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS events_dedup_key_idx ON events (dedup_key)`);
 }
 
-module.exports = { initSchema, migrateDedupKey };
+// 기존에 Luma 원문(한국어)으로 저장된 상태값을 정규화된 영어 값으로 옮긴다.
+// 코드가 상태를 문자열로 비교하므로(역행 방지, pending_count) 값이 언어에 따라
+// 갈리면 로직이 조용히 깨진다. 한국어 값만 매칭하므로 재실행해도 안전하다.
+async function migrateStatusesToEnglish(pool) {
+  await pool.query(`
+    UPDATE applications SET status = CASE status
+      WHEN '참석'         THEN 'Going'
+      WHEN '승인 대기 중'  THEN 'Pending approval'
+      WHEN '대기자 명단'   THEN 'Waitlist'
+      WHEN '초대됨'       THEN 'Invited'
+      WHEN '알수없음'      THEN 'Unknown'
+      ELSE status
+    END
+    WHERE status IN ('참석', '승인 대기 중', '대기자 명단', '초대됨', '알수없음')
+  `);
+}
+
+module.exports = { initSchema, migrateDedupKey, migrateStatusesToEnglish };

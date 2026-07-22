@@ -9,13 +9,15 @@ require('dotenv').config();
 const { App } = require('@slack/bolt');
 const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
-const { fmtWhen, buildScheduleText, buildEventStatsText, dedupKey } = require('./format');
+const {
+  fmtWhen, buildScheduleText, buildEventStatsText, dedupKey, STATUS_GOING, STATUS_VALUES,
+} = require('./format');
 const { initSchema } = require('./schema');
 
 const REQUIRED_ENV = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'DATABASE_URL', 'ANTHROPIC_API_KEY'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
 if (missingEnv.length) {
-  console.error(`⚠️ 누락된 환경변수: ${missingEnv.join(', ')}`);
+  console.error(`⚠️ Missing environment variables: ${missingEnv.join(', ')}`);
   process.exit(1);
 }
 
@@ -57,7 +59,9 @@ const EVENT_LIST_SCHEMA = {
           event_date: { type: ['string', 'null'], description: 'YYYY-MM-DD 형식. 연도가 없으면 2026년으로 추정' },
           event_time: { type: ['string', 'null'], description: 'HH:MM (24시간제) 형식' },
           luma_url: { type: ['string', 'null'] },
-          status: { type: 'string', description: '예: 참석, 승인 대기 중' },
+          // Luma 표시 언어와 무관하게 값을 고정한다. 코드가 상태를 문자열로 비교하므로
+          // (역행 방지, pending_count) 원문을 그대로 저장하면 언어에 따라 로직이 깨진다.
+          status: { type: 'string', enum: STATUS_VALUES },
         },
         required: ['title', 'host', 'location', 'event_date', 'event_time', 'luma_url', 'status'],
         additionalProperties: false,
@@ -78,7 +82,12 @@ function buildParsePrompt(text) {
    - 주의: 시간이 2개일 때 날짜 섹션 헤더는 보는 사람 기준 날짜라 행사 현지 날짜와 다를 수 있어. 이 경우 **섹션 헤더가 아니라 GMT 표기 옆의 날짜**를 따라야 해.
 2. "이벤트 만들기", "탐색", "가격", "도움말" 같은 네비게이션 문구, "...의 커버 이미지" 같은 이미지 설명, "+39" 같은 참석자 수 표시는 이벤트 정보가 아니니 무시해.
 3. 호스트가 여러 명이면("&", "외 N 명" 등) 있는 그대로 host 필드에 담아.
-4. status는 원문에 보이는 그대로 사용해 (예: 참석, 승인 대기 중).
+4. status는 원문 언어와 무관하게 아래 영어 값 중 하나로 정규화해서 넣어:
+   - 참석 / Going / Attending / Registered / Confirmed → "Going"
+   - 승인 대기 중 / Pending Approval / Awaiting Approval → "Pending approval"
+   - 대기자 명단 / Waitlist / Waiting List → "Waitlist"
+   - 초대됨 / Invited → "Invited"
+   - 위 어느 것에도 해당하지 않거나 판단이 어려우면 → "Unknown"
 5. 페이지에 luma_url(링크)이 보이지 않으면 luma_url은 null로 둬.
 
 텍스트:
@@ -99,7 +108,7 @@ async function parseWithClaude(text) {
   });
 
   if (response.stop_reason === 'refusal') {
-    throw new Error('Claude가 요청을 거부했어요.');
+    throw new Error('Claude declined the request.');
   }
 
   const textBlock = response.content.find((block) => block.type === 'text');
@@ -141,20 +150,20 @@ async function upsertAll(slackUserId, events) {
     const eventId = eventRes.rows[0].id;
     touchedEventIds.push(eventId);
 
-    // '참석'으로 확정된 신청을, 오래된 붙여넣기로 인해 '승인 대기 중'으로 되돌리지 않도록 방지
+    // 'Going'으로 확정된 신청을, 오래된 붙여넣기로 인해 대기 상태로 되돌리지 않도록 방지
     await pool.query(
       `INSERT INTO applications (student_id, event_id, status)
        VALUES ($1,$2,$3)
        ON CONFLICT (student_id, event_id) DO UPDATE SET
          status = CASE
-           WHEN applications.status = '참석' AND EXCLUDED.status = '승인 대기 중' THEN applications.status
+           WHEN applications.status = $4 AND EXCLUDED.status <> $4 THEN applications.status
            ELSE EXCLUDED.status
          END,
          created_at = CASE
-           WHEN applications.status = '참석' AND EXCLUDED.status = '승인 대기 중' THEN applications.created_at
+           WHEN applications.status = $4 AND EXCLUDED.status <> $4 THEN applications.created_at
            ELSE now()
          END`,
-      [studentId, eventId, ev.status || '알수없음']
+      [studentId, eventId, ev.status || 'Unknown', STATUS_GOING]
     );
   }
 
@@ -188,27 +197,27 @@ app.message(async ({ message, say }) => {
   if (!message.text || !message.text.trim()) return;
 
   if (message.text.length > MAX_INPUT_LENGTH) {
-    await say(`⚠️ 텍스트가 너무 길어요 (${message.text.length}자). ${MAX_INPUT_LENGTH}자 이하로 나눠서 보내주세요.`);
+    await say(`⚠️ That's too long (${message.text.length} characters). Please split it into parts under ${MAX_INPUT_LENGTH} characters.`);
     return;
   }
 
   try {
     const parsed = await parseWithClaude(message.text);
     if (!parsed.length) {
-      await say('파싱된 이벤트가 없어요. 텍스트를 확인해주세요.');
+      await say("No events found. Please check the text you pasted — copy the whole Luma page and try again.");
       return;
     }
     const { saved, removed, removedTitles } = await upsertAll(message.user, parsed);
     // 제거된 항목은 반드시 알려준다. 일부만 복사해 보냈을 때 본인이 바로 알아채야 하므로.
     const removedNote = removed
-      ? `\n🗑 취소된 일정 ${removed}개 제거:\n`
+      ? `\n🗑 Removed ${removed} cancelled event(s):\n`
         + removedTitles.map((t) => `  · ${t}`).join('\n')
-        + `\n(의도한 게 아니라면 Luma 페이지 전체를 다시 복사해 보내주세요.)`
+        + `\nIf that wasn't intended, please copy and send the entire Luma page again.`
       : '';
-    await say(`✅ ${saved}개 이벤트 저장 완료!${removedNote}`);
+    await say(`✅ Saved ${saved} event(s)!${removedNote}`);
   } catch (err) {
     console.error(err);
-    await say('⚠️ 처리 중 오류가 발생했어요.');
+    await say('⚠️ Something went wrong while processing your message. Please try again.');
   }
 });
 
@@ -229,9 +238,9 @@ app.command('/events', async ({ ack, respond }) => {
     ORDER BY e.event_date, e.event_time, s.name
   `);
   const text = res.rows.length
-    ? `🗓 *전체 신청 현황* _(행사 현지시각 기준)_\n`
+    ? `🗓 *All registrations* _(event local time)_\n`
       + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — <@${r.name}> (${r.status})`).join('\n')
-    : '신청 내역이 없습니다.';
+    : 'No registrations yet.';
   await respond({ text, response_type: 'in_channel' });
 });
 
@@ -289,9 +298,9 @@ app.command('/my-events', async ({ command, ack, respond }) => {
     [command.user_id]
   );
   const text = res.rows.length
-    ? `🙋 *내 신청 내역* _(행사 현지시각 기준)_\n`
+    ? `🙋 *My registrations* _(event local time)_\n`
       + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — ${r.status}`).join('\n')
-    : '신청 내역이 없습니다.';
+    : 'No registrations yet.';
   await respond(text);
 });
 
@@ -303,7 +312,7 @@ if (require.main === module) {
     await app.start(process.env.PORT || 3000);
     console.log('⚡️ techweek-slackbot running');
   })().catch((err) => {
-    console.error('❌ 시작 실패:', err);
+    console.error('❌ Startup failed:', err);
     process.exit(1);
   });
 }
