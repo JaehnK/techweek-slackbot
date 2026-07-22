@@ -117,10 +117,10 @@ function buildParsePrompt(text) {
   return `다음은 Luma 캘린더 메인 페이지 전체를 복사한 텍스트야. 여기 있는 모든 이벤트를 추출해줘.
 
 주의할 점:
-1. 시간 표기: 각 이벤트 줄에는 시간이 두 번 나올 수 있어. 예: "오전 7:30 · 7월 27일 오후 3:30 GMT-7"
-   - 앞의 시간(타임존 표기 없음)은 보는 사람 로컬 시간이니 무시해.
-   - "GMT±N" 같은 타임존이 붙은 뒤쪽 날짜/시간이 이벤트 실제 현지 시각이야. event_date/event_time에는 이 값을 사용해.
-   - 만약 타임존 표기가 붙은 시간이 없다면, 날짜 섹션 헤더(예: "7월 28일 화요일")와 그 아래 있는 시간을 사용해.
+1. 시간 표기 — event_date/event_time에는 **항상 행사 현지시각**을 넣어. Luma는 보는 사람의 타임존에 따라 시간을 1개 또는 2개로 표시해:
+   - **시간이 2개 있으면** (예: "오전 7:30 · 7월 27일 오후 3:30 GMT-7"): 뒤쪽의 "GMT±N"이 붙은 날짜/시간이 행사 현지시각이야. **그 날짜와 시간을 사용해** (위 예시는 event_date=2026-07-27, event_time=15:30). 앞의 타임존 없는 시간은 보는 사람 로컬 시간이니 무시해.
+   - **시간이 1개뿐이면** (GMT 표기 없음): 보는 사람 타임존과 행사 타임존이 같다는 뜻이라 그 시간이 곧 현지시각이야. 그 시간을 그대로 쓰고, 날짜는 위쪽 날짜 섹션 헤더(예: "7월 28일 화요일")를 사용해.
+   - 주의: 시간이 2개일 때 날짜 섹션 헤더는 보는 사람 기준 날짜라 행사 현지 날짜와 다를 수 있어. 이 경우 **섹션 헤더가 아니라 GMT 표기 옆의 날짜**를 따라야 해.
 2. "이벤트 만들기", "탐색", "가격", "도움말" 같은 네비게이션 문구, "...의 커버 이미지" 같은 이미지 설명, "+39" 같은 참석자 수 표시는 이벤트 정보가 아니니 무시해.
 3. 호스트가 여러 명이면("&", "외 N 명" 등) 있는 그대로 host 필드에 담아.
 4. status는 원문에 보이는 그대로 사용해 (예: 참석, 승인 대기 중).
@@ -240,8 +240,10 @@ app.command('/events', async ({ ack, respond }) => {
     JOIN students s ON s.id = a.student_id
     ORDER BY e.event_date, e.event_time, s.name
   `);
-  const text = res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — <@${r.name}> (${r.status})`).join('\n')
-    || '신청 내역이 없습니다.';
+  const text = res.rows.length
+    ? `🗓 *전체 신청 현황* _(행사 현지시각 기준)_\n`
+      + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — <@${r.name}> (${r.status})`).join('\n')
+    : '신청 내역이 없습니다.';
   await respond({ text, response_type: 'in_channel' });
 });
 
@@ -258,8 +260,10 @@ app.command('/event-stats', async ({ ack, respond }) => {
     GROUP BY e.id, e.title, e.event_date, e.event_time
     ORDER BY e.event_date, e.event_time
   `);
-  const text = res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — 총 ${r.total}명 (대기 ${r.pending})`).join('\n')
-    || '이벤트가 없습니다.';
+  const text = res.rows.length
+    ? `📊 *이벤트별 신청 통계* _(행사 현지시각 기준)_\n`
+      + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — 총 ${r.total}명 (대기 ${r.pending})`).join('\n')
+    : '이벤트가 없습니다.';
   await respond({ text, response_type: 'in_channel' });
 });
 
@@ -277,17 +281,24 @@ app.command('/my-events', async ({ command, ack, respond }) => {
      ORDER BY e.event_date, e.event_time`,
     [command.user_id]
   );
-  const text = res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — ${r.status}`).join('\n')
-    || '신청 내역이 없습니다.';
+  const text = res.rows.length
+    ? `🙋 *내 신청 내역* _(행사 현지시각 기준)_\n`
+      + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — ${r.status}`).join('\n')
+    : '신청 내역이 없습니다.';
   await respond(text);
 });
 
 // ---------- 6. 실행 ----------
-(async () => {
-  await initSchema();
-  await app.start(process.env.PORT || 3000);
-  console.log('⚡️ techweek-slackbot running');
-})().catch((err) => {
-  console.error('❌ 시작 실패:', err);
-  process.exit(1);
-});
+// 직접 실행할 때만 서버를 띄운다. require로 불러오면 파서만 꺼내 쓸 수 있음(테스트용).
+if (require.main === module) {
+  (async () => {
+    await initSchema();
+    await app.start(process.env.PORT || 3000);
+    console.log('⚡️ techweek-slackbot running');
+  })().catch((err) => {
+    console.error('❌ 시작 실패:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { parseWithClaude, buildParsePrompt, EVENT_LIST_SCHEMA };
