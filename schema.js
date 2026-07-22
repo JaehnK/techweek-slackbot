@@ -31,11 +31,13 @@ async function initSchema(pool) {
       UNIQUE (student_id, event_id)
     );
 
+    -- pending_count는 '아직 참석 확정이 아닌' 신청 수. 특정 상태('승인 대기 중')를 하드코딩하면
+    -- Luma에 새 상태(예: '대기자 명단')가 생길 때 조용히 누락되므로 '참석'이 아닌 것을 센다.
     CREATE OR REPLACE FUNCTION update_student_counts() RETURNS TRIGGER AS $$
     BEGIN
       UPDATE students SET
         application_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id)),
-        pending_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id) AND status = '승인 대기 중')
+        pending_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id) AND status <> '참석')
       WHERE id = COALESCE(NEW.student_id, OLD.student_id);
       RETURN NULL;
     END;
@@ -48,6 +50,23 @@ async function initSchema(pool) {
   `);
 
   await migrateDedupKey(pool);
+
+  // 트리거 함수가 바뀌어도 기존 행은 다음 변경 때까지 옛 값이 남으므로 즉시 재계산한다.
+  await pool.query(`
+    UPDATE students s SET
+      application_count = COALESCE(x.total, 0),
+      pending_count     = COALESCE(x.pending, 0)
+    FROM (
+      SELECT st.id,
+             COUNT(a.id)                                   AS total,
+             COUNT(a.id) FILTER (WHERE a.status <> '참석')  AS pending
+      FROM students st LEFT JOIN applications a ON a.student_id = st.id
+      GROUP BY st.id
+    ) x
+    WHERE s.id = x.id
+      AND (s.application_count IS DISTINCT FROM COALESCE(x.total, 0)
+        OR s.pending_count     IS DISTINCT FROM COALESCE(x.pending, 0))
+  `);
 }
 
 // 이벤트 중복 방지 키를 luma_url → dedup_key(title+날짜)로 옮긴다.

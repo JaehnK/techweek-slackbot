@@ -1,6 +1,6 @@
 // 슬래시 커맨드 출력 포맷 회귀 테스트. 외부 의존(DB/API) 없이 실행된다.
 const assert = require('assert');
-const { fmtWhen, weekdaySuffix, buildScheduleText } = require('./format');
+const { fmtWhen, weekdaySuffix, buildScheduleText, buildEventStatsText, dedupKey } = require('./format');
 
 let pass = 0;
 let fail = 0;
@@ -86,6 +86,36 @@ check('buildScheduleText: 길이 상한 초과 시 생략 표기', () => {
   const out = buildScheduleText(rows);
   assert.ok(out.includes('생략됨'), '생략 표기 없음');
   assert.ok(out.length <= 3000, `길이 상한 초과: ${out.length}`);
+});
+
+check('buildEventStatsText: 빈 결과', () => {
+  assert.strictEqual(buildEventStatsText([]), '이벤트가 없습니다.');
+});
+
+check('buildEventStatsText: 상태별로 분해해서 표시', () => {
+  const rows = [
+    { event_id: 1, event_date: '2026-07-27', event_time: '18:30', title: 'Kickoff', status: '대기자 명단', cnt: 1 },
+    { event_id: 2, event_date: '2026-07-29', event_time: '15:00', title: 'BBQ', status: '참석', cnt: 2 },
+    { event_id: 2, event_date: '2026-07-29', event_time: '15:00', title: 'BBQ', status: '승인 대기 중', cnt: 1 },
+  ];
+  const out = buildEventStatsText(rows);
+  // '대기자 명단'이 누락되지 않고 그대로 노출되어야 함 (예전엔 '대기 0'으로 사라졌음)
+  assert.ok(out.includes('Kickoff — 총 1명 · 대기자 명단 1'), `대기자 명단 표시 불일치:\n${out}`);
+  // 상태가 여러 개면 합계 + 상태별 분해
+  assert.ok(out.includes('BBQ — 총 3명 · 참석 2, 승인 대기 중 1'), `복수 상태 표시 불일치:\n${out}`);
+  // 같은 이벤트는 한 줄로
+  assert.strictEqual(out.split('BBQ —').length - 1, 1, '같은 이벤트가 중복 출력됨');
+});
+
+check('dedupKey: 공백/대소문자 차이를 흡수', () => {
+  assert.strictEqual(
+    dedupKey('  Tech BBQ   Throwdown | WTIA  ', '2026-07-29'),
+    dedupKey('Tech BBQ Throwdown | WTIA', '2026-07-29')
+  );
+});
+
+check('dedupKey: 날짜가 다르면 다른 키', () => {
+  assert.notStrictEqual(dedupKey('A', '2026-07-29'), dedupKey('A', '2026-07-30'));
 });
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

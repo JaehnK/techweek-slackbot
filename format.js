@@ -61,6 +61,29 @@ function buildScheduleText(rows) {
   return joinWithinLimit(lines);
 }
 
+// /event-stats 쿼리 결과(이벤트×상태 단위 행)를 이벤트별 통계 텍스트로 만든다.
+// '대기'처럼 특정 상태를 하드코딩해 세면 Luma에 새 상태(예: '대기자 명단')가 등장할 때
+// 조용히 누락되므로, 실제로 존재하는 상태를 그대로 나열한다.
+function buildEventStatsText(rows) {
+  if (!rows.length) return '이벤트가 없습니다.';
+
+  const byEvent = new Map();
+  for (const r of rows) {
+    if (!byEvent.has(r.event_id)) {
+      byEvent.set(r.event_id, { date: r.event_date, time: r.event_time, title: r.title, statuses: [] });
+    }
+    byEvent.get(r.event_id).statuses.push({ status: r.status, cnt: r.cnt });
+  }
+
+  const lines = ['📊 *이벤트별 신청 통계* _(행사 현지시각 기준)_'];
+  for (const ev of byEvent.values()) {
+    const total = ev.statuses.reduce((sum, s) => sum + s.cnt, 0);
+    const breakdown = ev.statuses.map((s) => `${s.status} ${s.cnt}`).join(', ');
+    lines.push(`${fmtWhen({ event_date: ev.date, event_time: ev.time })} | ${ev.title} — 총 ${total}명 · ${breakdown}`);
+  }
+  return joinWithinLimit(lines);
+}
+
 // 이벤트 중복 판정 키. 제목의 공백/대소문자 차이로 같은 이벤트가 갈라지지 않게 정규화한다.
 // migrateDedupKey()의 SQL 백필과 동일한 규칙을 유지해야 한다.
 function dedupKey(title, eventDate) {
@@ -68,4 +91,6 @@ function dedupKey(title, eventDate) {
   return `${normalized}|${eventDate || ''}`;
 }
 
-module.exports = { fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, dedupKey };
+module.exports = {
+  fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, buildEventStatsText, dedupKey,
+};

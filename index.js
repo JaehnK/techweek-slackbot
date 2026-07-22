@@ -9,7 +9,7 @@ require('dotenv').config();
 const { App } = require('@slack/bolt');
 const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
-const { fmtWhen, buildScheduleText, dedupKey } = require('./format');
+const { fmtWhen, buildScheduleText, buildEventStatsText, dedupKey } = require('./format');
 const { initSchema } = require('./schema');
 
 const REQUIRED_ENV = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'DATABASE_URL', 'ANTHROPIC_API_KEY'];
@@ -205,22 +205,20 @@ app.command('/events', async ({ ack, respond }) => {
 
 app.command('/event-stats', async ({ ack, respond }) => {
   await ack();
+  // 이벤트×상태 단위로 집계한다. 특정 상태를 하드코딩해 세면 새 상태가 누락된다.
   const res = await pool.query(`
-    SELECT e.title,
+    SELECT e.id AS event_id,
+           e.title,
            TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
            TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
-           COUNT(*) AS total,
-           COUNT(*) FILTER (WHERE a.status = '승인 대기 중') AS pending
+           a.status,
+           COUNT(*)::int AS cnt
     FROM applications a
     JOIN events e ON e.id = a.event_id
-    GROUP BY e.id, e.title, e.event_date, e.event_time
-    ORDER BY e.event_date, e.event_time
+    GROUP BY e.id, e.title, e.event_date, e.event_time, a.status
+    ORDER BY e.event_date NULLS LAST, e.event_time NULLS LAST, e.title, a.status
   `);
-  const text = res.rows.length
-    ? `📊 *이벤트별 신청 통계* _(행사 현지시각 기준)_\n`
-      + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — 총 ${r.total}명 (대기 ${r.pending})`).join('\n')
-    : '이벤트가 없습니다.';
-  await respond({ text, response_type: 'in_channel' });
+  await respond({ text: buildEventStatsText(res.rows), response_type: 'in_channel' });
 });
 
 // 날짜별 타임라인: 날짜 → 시간순 이벤트 → 상태별 참석자
