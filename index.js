@@ -10,7 +10,8 @@ const { App } = require('@slack/bolt');
 const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
 const {
-  fmtWhen, buildScheduleText, buildEventStatsText, dedupKey, STATUS_GOING, STATUS_VALUES,
+  fmtWhen, buildScheduleText, buildEventStatsText, buildStudentStatsText,
+  dedupKey, STATUS_GOING, STATUS_VALUES,
 } = require('./format');
 const { initSchema } = require('./schema');
 
@@ -281,6 +282,24 @@ app.command('/schedule', async ({ ack, respond }) => {
   `);
 
   await respond({ text: buildScheduleText(res.rows), response_type: 'in_channel' });
+});
+
+// 사람별 신청 요약. 신청이 하나도 없는 학생도 보이도록 students에서 LEFT JOIN 한다
+// (동기화로 전부 취소된 경우를 운영진이 알아챌 수 있어야 하므로).
+app.command('/students', async ({ ack, respond }) => {
+  await ack();
+  const res = await pool.query(`
+    SELECT s.id AS student_id,
+           s.name,
+           a.status,
+           COUNT(a.id)::int                        AS cnt,
+           SUM(COUNT(a.id)) OVER (PARTITION BY s.id)::int AS total
+    FROM students s
+    LEFT JOIN applications a ON a.student_id = s.id
+    GROUP BY s.id, s.name, a.status
+    ORDER BY total DESC, s.name, a.status
+  `);
+  await respond({ text: buildStudentStatsText(res.rows), response_type: 'in_channel' });
 });
 
 app.command('/my-events', async ({ command, ack, respond }) => {

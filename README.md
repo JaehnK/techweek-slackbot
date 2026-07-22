@@ -29,7 +29,8 @@ npm start
    |---|---|
    | `/events` | 전체 신청 현황 (평면 목록) |
    | `/schedule` | 시간대별 참석 현황 (날짜별 타임라인) |
-   | `/event-stats` | 이벤트별 신청 통계 |
+   | `/event-stats` | 이벤트별 신청 통계 (날짜별, 상태 분해) |
+   | `/students` | 인당 신청 현황 (사람별 합계 + 상태 분해) |
    | `/my-events` | 내 신청 내역 |
 5. **Basic Information**에서 Signing Secret 확인 → `SLACK_SIGNING_SECRET`
 6. 앱을 워크스페이스에 설치 후 Bot User OAuth Token(`xoxb-...`) 확인 → `SLACK_BOT_TOKEN`
@@ -54,7 +55,7 @@ Railway CLI로 배포 완료.
    printf '%s' 'xoxb-실제토큰' | railway variable set --service techweek-app --stdin SLACK_BOT_TOKEN
    ```
    `SLACK_SIGNING_SECRET`도 같은 방식으로 실제 값인지 확인/교체.
-3. Slack 앱 설정에서 **Event Subscriptions**(`message.im`)와 **Slash Commands**(`/events`, `/schedule`, `/event-stats`, `/my-events`)의 Request URL을 아래로 지정:
+3. Slack 앱 설정에서 **Event Subscriptions**(`message.im`)와 **Slash Commands**(`/events`, `/schedule`, `/event-stats`, `/students`, `/my-events`)의 Request URL을 아래로 지정:
    `https://techweek-app-production.up.railway.app/slack/events`
 4. `GET https://techweek-app-production.up.railway.app/health` → `ok` 확인 후 DM 테스트
 

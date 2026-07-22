@@ -101,6 +101,33 @@ function buildEventStatsText(rows) {
   return joinWithinLimit(lines);
 }
 
+// /students 쿼리 결과(학생×상태 단위 행)를 사람별 요약 텍스트로 만든다.
+// 신청이 많은 순으로 정렬돼 들어오므로, 참여가 적은 사람이 아래에 모여 눈에 띈다.
+function buildStudentStatsText(rows) {
+  if (!rows.length) return 'No one has registered a schedule yet.';
+
+  // 학생 → 상태별 건수 (Map이라 쿼리의 정렬 순서가 유지됨)
+  const byStudent = new Map();
+  for (const r of rows) {
+    if (!byStudent.has(r.student_id)) {
+      byStudent.set(r.student_id, { name: r.name, total: r.total, statuses: [] });
+    }
+    // LEFT JOIN이라 신청이 하나도 없는 학생은 status가 null로 한 행 들어온다
+    if (r.status && r.cnt > 0) {
+      byStudent.get(r.student_id).statuses.push({ status: r.status, cnt: r.cnt });
+    }
+  }
+
+  const lines = ['👥 *Registrations by person*', ''];
+  for (const st of byStudent.values()) {
+    const breakdown = st.statuses.length
+      ? st.statuses.map((s) => `${s.status} ${s.cnt}`).join(', ')
+      : '_no registrations_';
+    lines.push(`<@${st.name}> — Total *${st.total}* · ${breakdown}`);
+  }
+  return joinWithinLimit(lines);
+}
+
 // 이벤트 중복 판정 키. 제목의 공백/대소문자 차이로 같은 이벤트가 갈라지지 않게 정규화한다.
 // migrateDedupKey()의 SQL 백필과 동일한 규칙을 유지해야 한다.
 function dedupKey(title, eventDate) {
@@ -109,6 +136,6 @@ function dedupKey(title, eventDate) {
 }
 
 module.exports = {
-  fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, buildEventStatsText, dedupKey,
-  MAX_SLACK_TEXT, STATUS_GOING, STATUS_VALUES,
+  fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, buildEventStatsText,
+  buildStudentStatsText, dedupKey, MAX_SLACK_TEXT, STATUS_GOING, STATUS_VALUES,
 };

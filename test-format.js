@@ -1,7 +1,8 @@
 // 슬래시 커맨드 출력 포맷 회귀 테스트. 외부 의존(DB/API) 없이 실행된다.
 const assert = require('assert');
 const {
-  fmtWhen, weekdaySuffix, buildScheduleText, buildEventStatsText, dedupKey, MAX_SLACK_TEXT,
+  fmtWhen, weekdaySuffix, buildScheduleText, buildEventStatsText, buildStudentStatsText,
+  dedupKey, MAX_SLACK_TEXT,
 } = require('./format');
 
 let pass = 0;
@@ -124,6 +125,33 @@ check('buildEventStatsText: 시간/날짜 미정 처리', () => {
   ]);
   assert.ok(out.includes('📅 *Date TBD*'), '날짜 미정 그룹 없음');
   assert.ok(out.includes('`Time TBD`'), '시간미정 표기 없음');
+});
+
+check('buildStudentStatsText: 빈 결과', () => {
+  assert.strictEqual(buildStudentStatsText([]), 'No one has registered a schedule yet.');
+});
+
+check('buildStudentStatsText: 사람별 합계 + 상태별 분해', () => {
+  const rows = [
+    { student_id: 1, name: 'U1', status: 'Going', cnt: 6, total: 8 },
+    { student_id: 1, name: 'U1', status: 'Pending approval', cnt: 2, total: 8 },
+    { student_id: 2, name: 'U2', status: 'Waitlist', cnt: 1, total: 1 },
+  ];
+  const out = buildStudentStatsText(rows);
+  assert.ok(out.includes('<@U1> — Total *8* · Going 6, Pending approval 2'), `U1 표시 불일치:\n${out}`);
+  assert.ok(out.includes('<@U2> — Total *1* · Waitlist 1'), `U2 표시 불일치:\n${out}`);
+  // 같은 사람은 한 줄로
+  assert.strictEqual(out.split('<@U1>').length - 1, 1, '같은 사람이 중복 출력됨');
+  // 쿼리 정렬(합계 내림차순)이 유지되어야 함
+  assert.ok(out.indexOf('<@U1>') < out.indexOf('<@U2>'), '정렬 순서가 유지되지 않음');
+});
+
+check('buildStudentStatsText: 신청 0건인 사람도 표시', () => {
+  // LEFT JOIN이라 신청 없는 학생은 status=null, cnt=0으로 한 행 들어온다
+  const out = buildStudentStatsText([
+    { student_id: 3, name: 'U3', status: null, cnt: 0, total: 0 },
+  ]);
+  assert.ok(out.includes('<@U3> — Total *0* · _no registrations_'), `0건 표시 불일치:\n${out}`);
 });
 
 check('dedupKey: 공백/대소문자 차이를 흡수', () => {
