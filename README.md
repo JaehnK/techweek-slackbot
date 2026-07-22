@@ -23,7 +23,14 @@ npm start
 1. **Socket Mode는 사용하지 않음** — Events API(HTTP)로 동작하므로 배포 후 공개 URL이 필요하다.
 2. **OAuth & Permissions → Bot Token Scopes**: `chat:write`, `im:history`, `im:read`, `commands`
 3. **Event Subscriptions**: Request URL = `https://<railway-도메인>/slack/events` (배포 후 설정). Subscribe to bot events: `message.im`
-4. **Slash Commands**: `/events`, `/event-stats`, `/my-events` 각각 Request URL = `https://<railway-도메인>/slack/events`
+4. **Slash Commands**: 아래 4개 각각 Request URL = `https://<railway-도메인>/slack/events`
+
+   | Command | 설명 |
+   |---|---|
+   | `/events` | 전체 신청 현황 (평면 목록) |
+   | `/schedule` | 시간대별 참석 현황 (날짜별 타임라인) |
+   | `/event-stats` | 이벤트별 신청 통계 |
+   | `/my-events` | 내 신청 내역 |
 5. **Basic Information**에서 Signing Secret 확인 → `SLACK_SIGNING_SECRET`
 6. 앱을 워크스페이스에 설치 후 Bot User OAuth Token(`xoxb-...`) 확인 → `SLACK_BOT_TOKEN`
 
@@ -47,7 +54,7 @@ Railway CLI로 배포 완료.
    printf '%s' 'xoxb-실제토큰' | railway variable set --service techweek-app --stdin SLACK_BOT_TOKEN
    ```
    `SLACK_SIGNING_SECRET`도 같은 방식으로 실제 값인지 확인/교체.
-3. Slack 앱 설정에서 **Event Subscriptions**(`message.im`)와 **Slash Commands**(`/events`, `/event-stats`, `/my-events`)의 Request URL을 아래로 지정:
+3. Slack 앱 설정에서 **Event Subscriptions**(`message.im`)와 **Slash Commands**(`/events`, `/schedule`, `/event-stats`, `/my-events`)의 Request URL을 아래로 지정:
    `https://techweek-app-production.up.railway.app/slack/events`
 4. `GET https://techweek-app-production.up.railway.app/health` → `ok` 확인 후 DM 테스트
 
@@ -107,7 +114,10 @@ railway domain --service techweek-app      # 공개 도메인 발급
   - 시간이 **1개**면 (GMT 표기 없음) → 보는 사람 타임존 = 행사 타임존이라는 뜻이므로 그대로 쓰고, 날짜는 섹션 헤더를 사용한다.
   - ⚠️ 시간이 2개일 때 **날짜 섹션 헤더(`7월 28일 화요일`)를 따라가면 안 된다** — 그건 보는 사람 로컬 날짜라 행사 현지 날짜와 하루 어긋난다. 한국에서 보면 Luma 화면이 봇 출력보다 하루 뒤로 보이는 게 정상.
   - 이 규칙 덕에 어느 타임존에서 붙여넣어도 같은 값이 나와 중복 row가 안 생긴다. 슬래시 커맨드 출력에도 `(행사 현지시각 기준)`을 명시한다.
-- 파싱 회귀 검증: `npm run test:parse` — 실제 Luma 붙여넣기 샘플을 Claude에 보내 날짜/시간/상태가 기대값과 맞는지 확인한다 (실제 API를 호출하므로 `ANTHROPIC_API_KEY` 필요, 소량 과금).
+- 출력 포맷팅은 `format.js`(순수 함수)로 분리해 DB/Slack 없이 테스트할 수 있다. `index.js`에서 Bolt `App`을 생성하면 그 시점에 `auth.test`가 호출되므로, 포맷 로직을 `index.js`에 두면 테스트에서도 유효한 Slack 토큰이 필요해진다.
+- 테스트:
+  - `npm test` — 출력 포맷 회귀 테스트 (외부 의존 없음, 빠름)
+  - `npm run test:parse` — 실제 Luma 샘플을 Claude에 보내 날짜/시간/상태를 검증 (실제 API 호출 → `ANTHROPIC_API_KEY` 필요, 소량 과금)
 - `luma_url`이 텍스트에서 보이지 않으면(대부분의 경우) `title-event_date` 조합을 대신 유니크 키로 사용한다. 위 타임존 규칙이 깨지면 이 키도 흔들려 중복이 생기니 주의.
 - 신청 상태(`applications.status`)가 한 번 `참석`으로 확정되면, 오래된 텍스트를 다시 붙여넣어도 `승인 대기 중`으로 되돌아가지 않는다 (그 외 상태 전이는 항상 최신값으로 덮어씀).
 - `students.name` 컬럼에는 표시 이름이 아니라 **Slack user ID**가 저장된다 (조회 커맨드의 조인 키로 사용).

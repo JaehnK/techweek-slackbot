@@ -9,6 +9,7 @@ require('dotenv').config();
 const { App } = require('@slack/bolt');
 const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
+const { fmtWhen, buildScheduleText } = require('./format');
 
 const REQUIRED_ENV = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'DATABASE_URL', 'ANTHROPIC_API_KEY'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
@@ -221,11 +222,7 @@ app.message(async ({ message, say }) => {
 });
 
 // ---------- 5. 슬래시 커맨드 (전체 공개 조회) ----------
-// event_date/event_time은 쿼리에서 TO_CHAR로 문자열화됨. 날짜 없으면 '미정', 시간 있으면 뒤에 붙임.
-function fmtWhen(r) {
-  const date = r.event_date || '미정';
-  return r.event_time ? `${date} ${r.event_time}` : date;
-}
+// 출력 포맷팅은 format.js(순수 함수)로 분리되어 있다.
 
 app.command('/events', async ({ ack, respond }) => {
   await ack();
@@ -265,6 +262,27 @@ app.command('/event-stats', async ({ ack, respond }) => {
       + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — 총 ${r.total}명 (대기 ${r.pending})`).join('\n')
     : '이벤트가 없습니다.';
   await respond({ text, response_type: 'in_channel' });
+});
+
+// 날짜별 타임라인: 날짜 → 시간순 이벤트 → 상태별 참석자
+app.command('/schedule', async ({ ack, respond }) => {
+  await ack();
+  const res = await pool.query(`
+    SELECT e.id AS event_id,
+           TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+           TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
+           e.title,
+           a.status,
+           COUNT(*)::int AS cnt,
+           ARRAY_AGG(s.name ORDER BY s.name) AS members
+    FROM applications a
+    JOIN events e ON e.id = a.event_id
+    JOIN students s ON s.id = a.student_id
+    GROUP BY e.id, e.event_date, e.event_time, e.title, a.status
+    ORDER BY e.event_date NULLS LAST, e.event_time NULLS LAST, e.title, a.status
+  `);
+
+  await respond({ text: buildScheduleText(res.rows), response_type: 'in_channel' });
 });
 
 app.command('/my-events', async ({ command, ack, respond }) => {
