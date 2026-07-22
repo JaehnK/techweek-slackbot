@@ -9,7 +9,8 @@ require('dotenv').config();
 const { App } = require('@slack/bolt');
 const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
-const { fmtWhen, buildScheduleText } = require('./format');
+const { fmtWhen, buildScheduleText, dedupKey } = require('./format');
+const { initSchema } = require('./schema');
 
 const REQUIRED_ENV = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'DATABASE_URL', 'ANTHROPIC_API_KEY'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
@@ -40,53 +41,6 @@ const app = new App({
   ],
 });
 
-// ---------- 1. 스키마 초기화 ----------
-async function initSchema() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS students (
-      id SERIAL PRIMARY KEY,
-      name TEXT UNIQUE NOT NULL,
-      application_count INTEGER DEFAULT 0,
-      pending_count INTEGER DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );
-
-    CREATE TABLE IF NOT EXISTS events (
-      id SERIAL PRIMARY KEY,
-      title TEXT NOT NULL,
-      host TEXT,
-      location TEXT,
-      event_date DATE,
-      event_time TIME,
-      luma_url TEXT UNIQUE,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );
-
-    CREATE TABLE IF NOT EXISTS applications (
-      id SERIAL PRIMARY KEY,
-      student_id INTEGER REFERENCES students(id),
-      event_id INTEGER REFERENCES events(id),
-      status TEXT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      UNIQUE (student_id, event_id)
-    );
-
-    CREATE OR REPLACE FUNCTION update_student_counts() RETURNS TRIGGER AS $$
-    BEGIN
-      UPDATE students SET
-        application_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id)),
-        pending_count = (SELECT COUNT(*) FROM applications WHERE student_id = COALESCE(NEW.student_id, OLD.student_id) AND status = '승인 대기 중')
-      WHERE id = COALESCE(NEW.student_id, OLD.student_id);
-      RETURN NULL;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    DROP TRIGGER IF EXISTS trg_update_student_counts ON applications;
-    CREATE TRIGGER trg_update_student_counts
-    AFTER INSERT OR UPDATE OR DELETE ON applications
-    FOR EACH ROW EXECUTE FUNCTION update_student_counts();
-  `);
-}
 
 // ---------- 2. Claude로 파싱 (structured outputs) ----------
 const EVENT_LIST_SCHEMA = {
@@ -165,16 +119,21 @@ async function upsertAll(slackUserId, events) {
   const studentId = studentRes.rows[0].id;
 
   for (const ev of events) {
-    const key = ev.luma_url || `${ev.title}-${ev.event_date}`;
+    // 중복 키는 항상 제목+날짜에서 만든다. luma_url은 붙여넣기마다 있을 수도, 없을 수도 있어
+    // 키로 쓰면 같은 이벤트가 여러 행으로 갈라진다.
+    const key = dedupKey(ev.title, ev.event_date);
     const eventRes = await pool.query(
-      `INSERT INTO events (title, host, location, event_date, event_time, luma_url)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT (luma_url) DO UPDATE SET
+      `INSERT INTO events (title, host, location, event_date, event_time, luma_url, dedup_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (dedup_key) DO UPDATE SET
          title = EXCLUDED.title, host = EXCLUDED.host,
          location = EXCLUDED.location, event_date = EXCLUDED.event_date,
-         event_time = EXCLUDED.event_time
+         event_time = EXCLUDED.event_time,
+         -- URL은 한 번이라도 확보되면 유지 (URL 없는 붙여넣기가 덮어쓰지 않게)
+         luma_url = COALESCE(EXCLUDED.luma_url, events.luma_url)
        RETURNING id`,
-      [ev.title, ev.host || null, ev.location || null, ev.event_date || null, ev.event_time || null, key]
+      [ev.title, ev.host || null, ev.location || null, ev.event_date || null, ev.event_time || null,
+       ev.luma_url || null, key]
     );
     const eventId = eventRes.rows[0].id;
 
@@ -267,19 +226,19 @@ app.command('/event-stats', async ({ ack, respond }) => {
 // 날짜별 타임라인: 날짜 → 시간순 이벤트 → 상태별 참석자
 app.command('/schedule', async ({ ack, respond }) => {
   await ack();
+  // 같은 시간대는 이벤트가 달라도 한 묶음. 한 사람이 같은 시간에 여러 건을 신청했어도
+  // DISTINCT로 한 번만 센다.
   const res = await pool.query(`
-    SELECT e.id AS event_id,
-           TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+    SELECT TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
            TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
-           e.title,
            a.status,
-           COUNT(*)::int AS cnt,
-           ARRAY_AGG(s.name ORDER BY s.name) AS members
+           COUNT(DISTINCT s.id)::int            AS cnt,
+           ARRAY_AGG(DISTINCT s.name)           AS members
     FROM applications a
     JOIN events e ON e.id = a.event_id
     JOIN students s ON s.id = a.student_id
-    GROUP BY e.id, e.event_date, e.event_time, e.title, a.status
-    ORDER BY e.event_date NULLS LAST, e.event_time NULLS LAST, e.title, a.status
+    GROUP BY e.event_date, e.event_time, a.status
+    ORDER BY e.event_date NULLS LAST, e.event_time NULLS LAST, a.status
   `);
 
   await respond({ text: buildScheduleText(res.rows), response_type: 'in_channel' });
@@ -310,7 +269,7 @@ app.command('/my-events', async ({ command, ack, respond }) => {
 // 직접 실행할 때만 서버를 띄운다. require로 불러오면 파서만 꺼내 쓸 수 있음(테스트용).
 if (require.main === module) {
   (async () => {
-    await initSchema();
+    await initSchema(pool);
     await app.start(process.env.PORT || 3000);
     console.log('⚡️ techweek-slackbot running');
   })().catch((err) => {

@@ -30,34 +30,42 @@ function joinWithinLimit(lines) {
   return out.join('\n');
 }
 
-// /schedule 쿼리 결과(이벤트×상태 단위 행)를 날짜별 타임라인 텍스트로 만든다.
+// /schedule 쿼리 결과(날짜×시간×상태 단위 행)를 날짜별 타임라인 텍스트로 만든다.
+// 이벤트명은 표시하지 않고 같은 시간대는 한 줄로 묶는다 (누가 언제 비는지 보는 용도).
 function buildScheduleText(rows) {
   if (!rows.length) return '신청 내역이 없습니다.';
 
-  // 날짜 → 이벤트 → 상태별 참석자로 묶는다 (Map이라 쿼리의 정렬 순서가 유지됨)
+  // 날짜 → 시간 → 상태별 참석자로 묶는다 (Map이라 쿼리의 정렬 순서가 유지됨)
   const byDate = new Map();
   for (const r of rows) {
     const dateKey = r.event_date || '날짜 미정';
+    const timeKey = r.event_time || '시간미정';
     if (!byDate.has(dateKey)) byDate.set(dateKey, new Map());
-    const events = byDate.get(dateKey);
-    if (!events.has(r.event_id)) {
-      events.set(r.event_id, { time: r.event_time, title: r.title, statuses: [] });
-    }
-    events.get(r.event_id).statuses.push({ status: r.status, cnt: r.cnt, members: r.members });
+    const slots = byDate.get(dateKey);
+    if (!slots.has(timeKey)) slots.set(timeKey, []);
+    slots.get(timeKey).push({ status: r.status, cnt: r.cnt, members: r.members });
   }
 
   const lines = ['🗓 *시간대별 참석 현황* _(행사 현지시각 기준)_'];
-  for (const [date, events] of byDate) {
+  for (const [date, slots] of byDate) {
     lines.push('', `📅 *${date}${weekdaySuffix(date)}*`);
-    for (const ev of events.values()) {
-      lines.push(`\`${ev.time || '시간미정'}\`  ${ev.title}`);
-      for (const st of ev.statuses) {
+    for (const [time, statuses] of slots) {
+      statuses.forEach((st, i) => {
         const who = st.members.map((m) => `<@${m}>`).join(' ');
-        lines.push(`　　${st.status} ${st.cnt}명 · ${who}`);
-      }
+        // 같은 시간대에 상태가 여러 개면 첫 줄에만 시간을 쓰고 나머지는 들여쓴다
+        const prefix = i === 0 ? `\`${time}\`` : '　　　　';
+        lines.push(`${prefix}  ${st.status} ${st.cnt}명 · ${who}`);
+      });
     }
   }
   return joinWithinLimit(lines);
 }
 
-module.exports = { fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText };
+// 이벤트 중복 판정 키. 제목의 공백/대소문자 차이로 같은 이벤트가 갈라지지 않게 정규화한다.
+// migrateDedupKey()의 SQL 백필과 동일한 규칙을 유지해야 한다.
+function dedupKey(title, eventDate) {
+  const normalized = String(title || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  return `${normalized}|${eventDate || ''}`;
+}
+
+module.exports = { fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, dedupKey };
