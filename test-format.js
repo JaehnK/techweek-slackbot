@@ -1,6 +1,8 @@
 // 슬래시 커맨드 출력 포맷 회귀 테스트. 외부 의존(DB/API) 없이 실행된다.
 const assert = require('assert');
-const { fmtWhen, weekdaySuffix, buildScheduleText, buildEventStatsText, dedupKey } = require('./format');
+const {
+  fmtWhen, weekdaySuffix, buildScheduleText, buildEventStatsText, dedupKey, MAX_SLACK_TEXT,
+} = require('./format');
 
 let pass = 0;
 let fail = 0;
@@ -79,32 +81,49 @@ check('buildScheduleText: 시간/날짜 미정 처리', () => {
 });
 
 check('buildScheduleText: 길이 상한 초과 시 생략 표기', () => {
-  const rows = Array.from({ length: 300 }, (_, i) => ({
+  // 상한값을 하드코딩하지 않고 실제 설정값을 넉넉히 넘기도록 생성한다
+  const rows = Array.from({ length: 2000 }, (_, i) => ({
     event_date: '2026-07-27', event_time: `${String(i % 24).padStart(2, '0')}:00`,
     status: '참석', cnt: 20, members: Array.from({ length: 20 }, (_, j) => `USER${i}_${j}`),
   }));
   const out = buildScheduleText(rows);
   assert.ok(out.includes('생략됨'), '생략 표기 없음');
-  assert.ok(out.length <= 3000, `길이 상한 초과: ${out.length}`);
+  // 생략 안내 문구가 상한 뒤에 붙으므로 약간의 여유를 둔다
+  assert.ok(out.length <= MAX_SLACK_TEXT + 100, `길이 상한 초과: ${out.length} (상한 ${MAX_SLACK_TEXT})`);
 });
 
 check('buildEventStatsText: 빈 결과', () => {
   assert.strictEqual(buildEventStatsText([]), '이벤트가 없습니다.');
 });
 
-check('buildEventStatsText: 상태별로 분해해서 표시', () => {
+check('buildEventStatsText: 날짜별 단락 + 상태별 분해', () => {
   const rows = [
     { event_id: 1, event_date: '2026-07-27', event_time: '18:30', title: 'Kickoff', status: '대기자 명단', cnt: 1 },
     { event_id: 2, event_date: '2026-07-29', event_time: '15:00', title: 'BBQ', status: '참석', cnt: 2 },
     { event_id: 2, event_date: '2026-07-29', event_time: '15:00', title: 'BBQ', status: '승인 대기 중', cnt: 1 },
   ];
   const out = buildEventStatsText(rows);
-  // '대기자 명단'이 누락되지 않고 그대로 노출되어야 함 (예전엔 '대기 0'으로 사라졌음)
-  assert.ok(out.includes('Kickoff — 총 1명 · 대기자 명단 1'), `대기자 명단 표시 불일치:\n${out}`);
+
+  // 날짜별 헤더(요일 포함)로 단락이 나뉘어야 함
+  assert.ok(out.includes('📅 *2026-07-27 (월)*'), `07-27 헤더 없음:\n${out}`);
+  assert.ok(out.includes('📅 *2026-07-29 (수)*'), `07-29 헤더 없음:\n${out}`);
+  // 날짜 헤더 앞에는 빈 줄이 있어야 단락이 분리됨
+  assert.ok(out.includes('\n\n📅 *2026-07-29'), '날짜 단락 사이 빈 줄 없음');
+  // 시간은 백틱, 합계는 볼드
+  assert.ok(out.includes('`18:30`  Kickoff'), `시간 백틱 표기 불일치:\n${out}`);
+  assert.ok(out.includes('총 *1명* · 대기자 명단 1'), `대기자 명단/볼드 표시 불일치:\n${out}`);
   // 상태가 여러 개면 합계 + 상태별 분해
-  assert.ok(out.includes('BBQ — 총 3명 · 참석 2, 승인 대기 중 1'), `복수 상태 표시 불일치:\n${out}`);
-  // 같은 이벤트는 한 줄로
-  assert.strictEqual(out.split('BBQ —').length - 1, 1, '같은 이벤트가 중복 출력됨');
+  assert.ok(out.includes('총 *3명* · 참석 2, 승인 대기 중 1'), `복수 상태 표시 불일치:\n${out}`);
+  // 같은 이벤트 제목은 한 번만
+  assert.strictEqual(out.split('BBQ').length - 1, 1, '같은 이벤트가 중복 출력됨');
+});
+
+check('buildEventStatsText: 시간/날짜 미정 처리', () => {
+  const out = buildEventStatsText([
+    { event_id: 9, event_date: null, event_time: null, title: '미정건', status: '참석', cnt: 1 },
+  ]);
+  assert.ok(out.includes('📅 *날짜 미정*'), '날짜 미정 그룹 없음');
+  assert.ok(out.includes('`시간미정`'), '시간미정 표기 없음');
 });
 
 check('dedupKey: 공백/대소문자 차이를 흡수', () => {

@@ -15,7 +15,9 @@ function weekdaySuffix(dateStr) {
 }
 
 // Slack 메시지 길이 상한에 걸리지 않도록 줄 단위로 잘라 붙인다.
-const MAX_SLACK_TEXT = 2900;
+// Slack의 text 상한은 4만자라 여유가 있지만, 인원이 늘어도 잘리지 않으면서
+// 한 메시지가 감당 가능한 선으로 둔다(초과분은 Slack이 '더 보기'로 접는다).
+const MAX_SLACK_TEXT = 12000;
 function joinWithinLimit(lines) {
   const out = [];
   let len = 0;
@@ -67,19 +69,27 @@ function buildScheduleText(rows) {
 function buildEventStatsText(rows) {
   if (!rows.length) return '이벤트가 없습니다.';
 
-  const byEvent = new Map();
+  // 날짜 → 이벤트 → 상태별 집계 (Map이라 쿼리의 정렬 순서가 유지됨)
+  const byDate = new Map();
   for (const r of rows) {
-    if (!byEvent.has(r.event_id)) {
-      byEvent.set(r.event_id, { date: r.event_date, time: r.event_time, title: r.title, statuses: [] });
+    const dateKey = r.event_date || '날짜 미정';
+    if (!byDate.has(dateKey)) byDate.set(dateKey, new Map());
+    const events = byDate.get(dateKey);
+    if (!events.has(r.event_id)) {
+      events.set(r.event_id, { time: r.event_time, title: r.title, statuses: [] });
     }
-    byEvent.get(r.event_id).statuses.push({ status: r.status, cnt: r.cnt });
+    events.get(r.event_id).statuses.push({ status: r.status, cnt: r.cnt });
   }
 
   const lines = ['📊 *이벤트별 신청 통계* _(행사 현지시각 기준)_'];
-  for (const ev of byEvent.values()) {
-    const total = ev.statuses.reduce((sum, s) => sum + s.cnt, 0);
-    const breakdown = ev.statuses.map((s) => `${s.status} ${s.cnt}`).join(', ');
-    lines.push(`${fmtWhen({ event_date: ev.date, event_time: ev.time })} | ${ev.title} — 총 ${total}명 · ${breakdown}`);
+  for (const [date, events] of byDate) {
+    lines.push('', `📅 *${date}${weekdaySuffix(date)}*`);
+    for (const ev of events.values()) {
+      const total = ev.statuses.reduce((sum, s) => sum + s.cnt, 0);
+      const breakdown = ev.statuses.map((s) => `${s.status} ${s.cnt}`).join(', ');
+      lines.push(`\`${ev.time || '시간미정'}\`  ${ev.title}`);
+      lines.push(`　　　　총 *${total}명* · ${breakdown}`);
+    }
   }
   return joinWithinLimit(lines);
 }
@@ -93,4 +103,5 @@ function dedupKey(title, eventDate) {
 
 module.exports = {
   fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, buildEventStatsText, dedupKey,
+  MAX_SLACK_TEXT,
 };
