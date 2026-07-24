@@ -1,5 +1,91 @@
-// 관리자 대시보드 HTML 렌더링. DB/Slack에 의존하지 않는 순수 함수라 단독 테스트 가능.
+// 관리자 대시보드. 조회·렌더·HTTP 핸들러 모두 의존성을 인자로 받아 Slack 앱 없이 단독 테스트 가능.
+const crypto = require('crypto');
 const { weekdaySuffix } = require('./format');
+
+// 길이가 달라도 timingSafeEqual이 던지지 않도록 해시로 비교한다.
+function tokenMatches(expected, provided) {
+  if (!expected || !provided) return false;
+  const a = crypto.createHash('sha256').update(String(provided)).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// GET /admin 핸들러. 토큰이 없으면 존재 자체를 숨기고(404), 틀리면 401.
+function createAdminHandler({ token, buildHtml }) {
+  return async (req, res) => {
+    try {
+      if (!token) {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Not found');
+        return;
+      }
+      const url = new URL(req.url, 'http://localhost');
+      const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+      if (!tokenMatches(token, url.searchParams.get('key') || bearer)) {
+        res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Unauthorized');
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        // 토큰이 URL에 담기므로 캐시/색인/리퍼러 유출을 막는다
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer',
+        'x-robots-tag': 'noindex, nofollow',
+      });
+      res.end(await buildHtml());
+    } catch (err) {
+      console.error('dashboard error:', err);
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Internal error');
+    }
+  };
+}
+
+// 대시보드가 쓰는 세 갈래 집계. 서로 독립이라 병렬로 던진다.
+async function fetchDashboardData(pool) {
+  const [summary, events, students] = await Promise.all([
+    pool.query(`
+      SELECT (SELECT COUNT(*) FROM students)::int     AS students,
+             (SELECT COUNT(*) FROM events)::int       AS events,
+             (SELECT COUNT(*) FROM applications)::int AS applications
+    `),
+    pool.query(`
+      SELECT e.id AS event_id, e.title, e.location, e.luma_url,
+             TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+             TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
+             a.status,
+             COUNT(*)::int AS cnt,
+             ARRAY_AGG(COALESCE(s.display_name, s.name)
+                       ORDER BY COALESCE(s.display_name, s.name)) AS members
+      FROM events e
+      JOIN applications a ON a.event_id = e.id
+      JOIN students s     ON s.id = a.student_id
+      GROUP BY e.id, e.title, e.location, e.luma_url, e.event_date, e.event_time, a.status
+      ORDER BY e.event_date NULLS LAST, e.event_time NULLS LAST, e.title, a.status
+    `),
+    // 신청이 0건인 사람도 보여야 하므로 students에서 LEFT JOIN 한다.
+    // 그 경우 status는 null, COUNT(a.id)는 0이 되고 렌더 쪽에서 걸러낸다.
+    pool.query(`
+      SELECT s.id AS student_id,
+             COALESCE(s.display_name, s.name) AS label,
+             s.name                           AS slack_id,
+             a.status,
+             COUNT(a.id)::int                                 AS cnt,
+             SUM(COUNT(a.id)) OVER (PARTITION BY s.id)::int   AS total
+      FROM students s
+      LEFT JOIN applications a ON a.student_id = s.id
+      GROUP BY s.id, s.display_name, s.name, a.status
+      ORDER BY total DESC, label, a.status
+    `),
+  ]);
+
+  return {
+    summary: summary.rows[0],
+    eventRows: events.rows,
+    studentRows: students.rows,
+  };
+}
 
 // 이벤트 제목·장소·호스트는 Luma에서 파싱한 외부 문자열이라 반드시 이스케이프한다.
 function escapeHtml(value) {
@@ -137,4 +223,7 @@ ${renderStudents(studentRows)}
 </div></body></html>`;
 }
 
-module.exports = { renderDashboard, renderEventsByDate, renderStudents, escapeHtml };
+module.exports = {
+  createAdminHandler, tokenMatches, fetchDashboardData,
+  renderDashboard, renderEventsByDate, renderStudents, escapeHtml,
+};

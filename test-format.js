@@ -7,15 +7,20 @@ const {
 
 let pass = 0;
 let fail = 0;
+// 등록만 해두고 맨 아래에서 순서대로 실행한다. 그래야 async 테스트의 실패가
+// 조용히 통과로 집계되지 않는다(동기 try/catch는 거부된 프로미스를 못 잡는다).
+const queued = [];
 function check(name, fn) {
-  try {
-    fn();
-    console.log(`✅ ${name}`);
-    pass++;
-  } catch (e) {
-    console.log(`❌ ${name}\n   ${e.message}`);
-    fail++;
-  }
+  queued.push(async () => {
+    try {
+      await fn();
+      console.log(`✅ ${name}`);
+      pass++;
+    } catch (e) {
+      console.log(`❌ ${name}\n   ${e.message}`);
+      fail++;
+    }
+  });
 }
 
 check('fmtWhen: 날짜+시간', () => {
@@ -167,7 +172,76 @@ check('dedupKey: 날짜가 다르면 다른 키', () => {
 
 
 // ---------- 관리자 대시보드 ----------
-const { renderDashboard, escapeHtml } = require('./dashboard');
+const { renderDashboard, escapeHtml, tokenMatches, createAdminHandler } = require('./dashboard');
+
+// 응답을 받아 적는 최소 http.ServerResponse 대역
+function fakeRes() {
+  return {
+    status: null, headers: null, body: null,
+    writeHead(status, headers) { this.status = status; this.headers = headers || {}; },
+    end(body) { this.body = body; },
+  };
+}
+const fakeReq = (url, headers = {}) => ({ url, headers });
+
+check('tokenMatches: 일치/불일치/길이 다름', () => {
+  assert.strictEqual(tokenMatches('abc123', 'abc123'), true);
+  assert.strictEqual(tokenMatches('abc123', 'abc124'), false);
+  // 길이가 다르면 timingSafeEqual이 던지므로 해시 후 비교해야 한다
+  assert.strictEqual(tokenMatches('abc123', 'x'), false);
+  assert.strictEqual(tokenMatches('abc123', ''), false);
+  assert.strictEqual(tokenMatches('', 'abc123'), false);
+});
+
+check('/admin: 토큰 미설정이면 404 (라우트 존재를 숨김)', async () => {
+  const res = fakeRes();
+  await createAdminHandler({ token: '', buildHtml: async () => 'SECRET' })(
+    fakeReq('/admin?key=anything'), res
+  );
+  assert.strictEqual(res.status, 404);
+  assert.ok(!String(res.body).includes('SECRET'), '본문이 노출됨');
+});
+
+check('/admin: 토큰 틀리거나 없으면 401', async () => {
+  for (const url of ['/admin', '/admin?key=wrong', '/admin?key=']) {
+    const res = fakeRes();
+    await createAdminHandler({ token: 'right', buildHtml: async () => 'SECRET' })(fakeReq(url), res);
+    assert.strictEqual(res.status, 401, `${url}가 401이 아님`);
+    assert.ok(!String(res.body).includes('SECRET'), `${url}에서 본문이 노출됨`);
+  }
+});
+
+check('/admin: ?key= 와 Bearer 헤더 모두 통과, 보안 헤더 포함', async () => {
+  const handler = createAdminHandler({ token: 'right', buildHtml: async () => '<html>OK</html>' });
+  const viaQuery = fakeRes();
+  await handler(fakeReq('/admin?key=right'), viaQuery);
+  assert.strictEqual(viaQuery.status, 200);
+  assert.strictEqual(viaQuery.body, '<html>OK</html>');
+  // 토큰이 URL에 남으므로 캐시/색인/리퍼러를 모두 막아야 한다
+  assert.strictEqual(viaQuery.headers['cache-control'], 'no-store');
+  assert.strictEqual(viaQuery.headers['referrer-policy'], 'no-referrer');
+  assert.ok(viaQuery.headers['x-robots-tag'].includes('noindex'));
+
+  const viaHeader = fakeRes();
+  await handler(fakeReq('/admin', { authorization: 'Bearer right' }), viaHeader);
+  assert.strictEqual(viaHeader.status, 200, 'Bearer 인증 실패');
+});
+
+check('/admin: 조회 실패 시 500이며 내부 오류를 노출하지 않음', async () => {
+  const res = fakeRes();
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    await createAdminHandler({
+      token: 'right',
+      buildHtml: async () => { throw new Error('postgres://user:pw@host down'); },
+    })(fakeReq('/admin?key=right'), res);
+  } finally {
+    console.error = quiet;
+  }
+  assert.strictEqual(res.status, 500);
+  assert.ok(!String(res.body).includes('postgres'), '내부 오류 메시지가 노출됨');
+});
 
 check('escapeHtml: HTML 특수문자 이스케이프', () => {
   assert.strictEqual(escapeHtml(`<script>"&'`), '&lt;script&gt;&quot;&amp;&#39;');
@@ -212,5 +286,8 @@ check('renderDashboard: 표시 이름이 없으면 Slack ID 중복 표기 안 �
   assert.ok(html.includes('no registrations'), '0건 표기 없음');
 });
 
-console.log(`\n=== ${pass} passed, ${fail} failed ===`);
-process.exit(fail === 0 ? 0 : 1);
+(async () => {
+  for (const run of queued) await run();
+  console.log(`\n=== ${pass} passed, ${fail} failed ===`);
+  process.exit(fail === 0 ? 0 : 1);
+})();

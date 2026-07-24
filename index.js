@@ -14,8 +14,7 @@ const {
   dedupKey, STATUS_GOING, STATUS_VALUES,
 } = require('./format');
 const { initSchema } = require('./schema');
-const { renderDashboard } = require('./dashboard');
-const crypto = require('crypto');
+const { createAdminHandler, fetchDashboardData, renderDashboard } = require('./dashboard');
 
 const REQUIRED_ENV = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'DATABASE_URL', 'ANTHROPIC_API_KEY'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
@@ -31,16 +30,8 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // 관리자 대시보드는 공개 도메인에 노출되므로 토큰이 설정된 경우에만 활성화한다.
-// 토큰이 없으면 라우트를 아예 등록하지 않아 교육생 정보가 새어나가지 않게 한다.
+// 토큰이 없으면 핸들러가 404를 돌려주어 교육생 정보가 새어나가지 않게 한다.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-
-// 길이가 달라도 timingSafeEqual이 던지지 않도록 해시로 비교한다.
-function tokenMatches(provided) {
-  if (!ADMIN_TOKEN || !provided) return false;
-  const a = crypto.createHash('sha256').update(String(provided)).digest();
-  const b = crypto.createHash('sha256').update(ADMIN_TOKEN).digest();
-  return crypto.timingSafeEqual(a, b);
-}
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -58,34 +49,7 @@ const app = new App({
     {
       path: '/admin',
       method: ['GET'],
-      handler: async (req, res) => {
-        try {
-          if (!ADMIN_TOKEN) {
-            res.writeHead(404); res.end('Not found');
-            return;
-          }
-          const url = new URL(req.url, 'http://localhost');
-          const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-          if (!tokenMatches(url.searchParams.get('key') || bearer)) {
-            res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
-            res.end('Unauthorized');
-            return;
-          }
-          const html = await buildDashboardHtml();
-          res.writeHead(200, {
-            'content-type': 'text/html; charset=utf-8',
-            // 토큰이 URL에 담기므로 캐시/색인되지 않게 한다
-            'cache-control': 'no-store',
-            'referrer-policy': 'no-referrer',
-            'x-robots-tag': 'noindex, nofollow',
-          });
-          res.end(html);
-        } catch (err) {
-          console.error('dashboard error:', err);
-          res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
-          res.end('Internal error');
-        }
-      },
+      handler: createAdminHandler({ token: ADMIN_TOKEN, buildHtml: buildDashboardHtml }),
     },
   ],
 });
@@ -237,46 +201,10 @@ async function upsertAll(slackUserId, events) {
   };
 }
 
-// ---------- 3-b. 관리자 대시보드 데이터 ----------
+// ---------- 3-b. 관리자 대시보드 ----------
 async function buildDashboardHtml() {
-  const [summary, events, students] = await Promise.all([
-    pool.query(`
-      SELECT (SELECT COUNT(*) FROM students)::int     AS students,
-             (SELECT COUNT(*) FROM events)::int       AS events,
-             (SELECT COUNT(*) FROM applications)::int AS applications
-    `),
-    pool.query(`
-      SELECT e.id AS event_id, e.title, e.location, e.luma_url,
-             TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
-             TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
-             a.status,
-             COUNT(*)::int AS cnt,
-             ARRAY_AGG(COALESCE(s.display_name, s.name)
-                       ORDER BY COALESCE(s.display_name, s.name)) AS members
-      FROM events e
-      JOIN applications a ON a.event_id = e.id
-      JOIN students s     ON s.id = a.student_id
-      GROUP BY e.id, e.title, e.location, e.luma_url, e.event_date, e.event_time, a.status
-      ORDER BY e.event_date NULLS LAST, e.event_time NULLS LAST, e.title, a.status
-    `),
-    pool.query(`
-      SELECT s.id AS student_id,
-             COALESCE(s.display_name, s.name) AS label,
-             s.name                           AS slack_id,
-             a.status,
-             COUNT(a.id)::int                                 AS cnt,
-             SUM(COUNT(a.id)) OVER (PARTITION BY s.id)::int   AS total
-      FROM students s
-      LEFT JOIN applications a ON a.student_id = s.id
-      GROUP BY s.id, s.display_name, s.name, a.status
-      ORDER BY total DESC, label, a.status
-    `),
-  ]);
-
   return renderDashboard({
-    summary: summary.rows[0],
-    eventRows: events.rows,
-    studentRows: students.rows,
+    ...(await fetchDashboardData(pool)),
     generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC',
   });
 }
@@ -288,14 +216,30 @@ async function rememberDisplayName(client, slackUserId) {
     const info = await client.users.info({ user: slackUserId });
     const p = info.user?.profile || {};
     const name = p.display_name || p.real_name || info.user?.name;
-    if (!name) return;
+    if (!name) return false;
     await pool.query(
       `UPDATE students SET display_name = $2 WHERE name = $1 AND display_name IS DISTINCT FROM $2`,
       [slackUserId, name]
     );
+    return true;
   } catch (err) {
     console.warn('display name lookup skipped:', err.data?.error || err.message);
+    return false;
   }
+}
+
+// 기존 학생은 다시 DM을 보내기 전까지 display_name이 비어 대시보드에 Slack ID로만 보인다.
+// 그래서 기동 시 한 번 미채움분을 메운다. 실패는 로그만 남기고 기동을 막지 않는다.
+async function backfillDisplayNames(client) {
+  const { rows } = await pool.query(
+    `SELECT name FROM students WHERE display_name IS NULL ORDER BY id`
+  );
+  if (!rows.length) return;
+  let filled = 0;
+  for (const { name } of rows) {
+    if (await rememberDisplayName(client, name)) filled += 1;
+  }
+  console.log(`display names backfilled: ${filled}/${rows.length}`);
 }
 
 // ---------- 4. DM 수신 → 파싱 → 저장 ----------
@@ -438,6 +382,12 @@ if (require.main === module) {
     await initSchema(pool);
     await app.start(process.env.PORT || 3000);
     console.log('⚡️ techweek-slackbot running');
+    if (ADMIN_TOKEN) {
+      // 기동을 지연시키지 않도록 서버가 뜬 뒤 백그라운드로 돌린다
+      backfillDisplayNames(app.client).catch((err) => {
+        console.warn('display name backfill skipped:', err.message);
+      });
+    }
   })().catch((err) => {
     console.error('❌ Startup failed:', err);
     process.exit(1);
