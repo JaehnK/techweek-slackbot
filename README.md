@@ -65,19 +65,23 @@ Railway CLI로 배포 완료.
 - **환경변수**: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `ANTHROPIC_API_KEY`는 CLI로 설정됨. `DATABASE_URL`은 `${{Postgres.DATABASE_URL}}` 참조로 연결(내부 네트워크). `PORT`는 Railway가 자동 주입.
 - **빌드**: Railway가 `package.json` 감지 → `npm install` → `npm start`.
 
-### ⚠️ 남은 작업 — 유효한 Slack 토큰 필요
+앱은 정상 상주 중이다 (`/health` → 200, Slack `auth.test` 통과, 대시보드가 실데이터를 서빙).
 
-현재 앱은 빌드·DB 연결·스키마 생성까지 정상이지만, `SLACK_BOT_TOKEN`이 유효하지 않아 기동 직후 Slack `invalid_auth`로 크래시-루프 중이다. 아래를 완료하면 정상 상주한다:
+- 로컬 개발용 `DATABASE_URL`은 Railway 공개 프록시(`DATABASE_PUBLIC_URL`)를 쓴다. 값은 `railway variables --service Postgres --kv`로 확인.
+  배포 환경에서는 내부 네트워크(`postgres.railway.internal`)를 쓰므로 둘을 섞지 말 것.
+- **GitHub 자동 배포가 걸려 있지 않다.** main에 머지해도 반영되지 않으므로 `railway up --service techweek-app`으로 수동 배포해야 한다.
 
-1. api.slack.com/apps에서 앱을 만들고 워크스페이스에 설치해 **유효한 Bot User OAuth Token(`xoxb-...`)** 확보
-2. 토큰 교체 (값이 로그에 안 남게 stdin으로):
+### ⚠️ 남은 작업 — `users:read` 스코프
+
+대시보드가 참석자를 표시 이름 대신 Slack ID(`U…`)로 보여준다. 봇 토큰에 `users:read`가 없어 `users.info` 호출이 `missing_scope`로 실패하기 때문(기동 로그의 `display names backfilled: 0/17`). 봇 동작 자체에는 영향이 없다.
+
+1. api.slack.com/apps → **OAuth & Permissions → Bot Token Scopes**에 `users:read` 추가
+2. **워크스페이스에 앱 재설치** (스코프 추가만으로는 권한이 부여되지 않는다)
+3. 재설치로 `xoxb-` 토큰이 바뀌면 교체 (값이 로그에 안 남게 stdin으로):
    ```bash
-   printf '%s' 'xoxb-실제토큰' | railway variable set --service techweek-app --stdin SLACK_BOT_TOKEN
+   printf '%s' 'xoxb-새토큰' | railway variable set --service techweek-app --stdin SLACK_BOT_TOKEN
    ```
-   `SLACK_SIGNING_SECRET`도 같은 방식으로 실제 값인지 확인/교체.
-3. Slack 앱 설정에서 **Event Subscriptions**(`message.im`)와 **Slash Commands**(`/events`, `/schedule`, `/event-stats`, `/students`, `/my-events`)의 Request URL을 아래로 지정:
-   `https://techweek-app-production.up.railway.app/slack/events`
-4. `GET https://techweek-app-production.up.railway.app/health` → `ok` 확인 후 DM 테스트
+4. 재배포하면 기동 직후 백필이 다시 돌아 표시 이름이 채워진다. 로그에서 `display names backfilled: N/17` 확인.
 
 ### 참고 — CLI로 처음부터 다시 배포하는 절차
 
