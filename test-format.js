@@ -172,7 +172,9 @@ check('dedupKey: 날짜가 다르면 다른 키', () => {
 
 
 // ---------- 관리자 대시보드 ----------
-const { renderDashboard, escapeHtml, tokenMatches, createAdminHandler } = require('./dashboard');
+const {
+  renderDashboard, escapeHtml, tokenMatches, createAdminHandler, buildTimeSlotPayload,
+} = require('./dashboard');
 
 // 응답을 받아 적는 최소 http.ServerResponse 대역
 function fakeRes() {
@@ -249,19 +251,22 @@ check('escapeHtml: HTML 특수문자 이스케이프', () => {
 });
 
 check('renderDashboard: 이벤트 제목의 XSS가 이스케이프됨', () => {
-  // 제목/장소는 Luma에서 파싱한 외부 문자열이라 그대로 넣으면 스크립트가 실행된다
+  // 제목/장소는 Luma에서 파싱한 외부 문자열이라 그대로 넣으면 스크립트가 실행된다.
+  // 페이지에는 정당한 <script>(임베드 JSON·클라이언트 JS)가 있으므로, 외부 문자열은
+  // '<script>' 존재 여부가 아니라 고유 마커의 raw 노출 여부로 검사한다.
   const html = renderDashboard({
     summary: { students: 1, events: 1, applications: 1 },
     eventRows: [{
       event_id: 1, title: '<img src=x onerror=alert(1)>', location: '<b>loc</b>', luma_url: null,
-      event_date: '2026-07-27', event_time: '15:30', status: 'Going', cnt: 1, members: ['<script>'],
+      event_date: '2026-07-27', event_time: '15:30', status: 'Going', cnt: 1, members: ['<b>PWN</b>'],
     }],
     studentRows: [{ student_id: 1, label: 'Alice', slack_id: 'U1', status: 'Going', cnt: 1, total: 1 }],
     generatedAt: '2026-07-22 00:00 UTC',
   });
   assert.ok(!html.includes('<img src=x'), '제목이 이스케이프되지 않음');
-  assert.ok(!html.includes('<script>'), '참석자명이 이스케이프되지 않음');
-  assert.ok(html.includes('&lt;img src=x'), '이스케이프된 제목이 없음');
+  assert.ok(!html.includes('<b>PWN</b>'), '참석자명이 raw로 노출됨');
+  assert.ok(html.includes('&lt;img src=x'), 'schedule 탭 이스케이프 제목 없음');
+  assert.ok(html.includes('\\u003cimg src=x'), '임베드 JSON 제목이 \\u003c로 이스케이프되지 않음');
   assert.ok(html.includes('2026-07-27 (Mon)'), '날짜/요일 표기 없음');
 });
 
@@ -284,6 +289,68 @@ check('renderDashboard: 표시 이름이 없으면 Slack ID 중복 표기 안 �
   });
   assert.strictEqual(html.split('U9').length - 1, 1, 'Slack ID가 중복 표기됨');
   assert.ok(html.includes('no registrations'), '0건 표기 없음');
+});
+
+// ---------- 시간대 대시보드 ----------
+const tsRows = [
+  // event 1: 15:30, Going 3 + Waitlist 1
+  { event_id: 1, title: 'AI Night', location: 'SF', luma_url: 'javascript:alert(1)', event_date: '2026-07-28', event_time: '15:30', status: 'Going', cnt: 3, members: ['Alice', 'Bob'] },
+  { event_id: 1, title: 'AI Night', location: 'SF', luma_url: 'javascript:alert(1)', event_date: '2026-07-28', event_time: '15:30', status: 'Waitlist', cnt: 1, members: ['Carol'] },
+  // event 2: 같은 날 같은 15:30 → 동시간, Bob이 겹침
+  { event_id: 2, title: 'Robotics', location: null, luma_url: 'https://lu.ma/x', event_date: '2026-07-28', event_time: '15:30', status: 'Going', cnt: 2, members: ['Bob', 'Dan'] },
+  // event 3: 이른 시각
+  { event_id: 3, title: 'Morning', location: null, luma_url: null, event_date: '2026-07-27', event_time: '09:00', status: 'Going', cnt: 5, members: ['Eve'] },
+  // event 4: 날짜/시간 미정
+  { event_id: 4, title: 'TBD', location: null, luma_url: null, event_date: null, event_time: null, status: 'Going', cnt: 1, members: ['Fay'] },
+];
+
+check('buildTimeSlotPayload: 이벤트별로 상태를 접고 메타를 보존', () => {
+  const p = buildTimeSlotPayload(tsRows);
+  assert.strictEqual(p.events.length, 4, '이벤트 수 오류');
+  const ev1 = p.events.find((e) => e.id === 1);
+  assert.strictEqual(ev1.statuses.length, 2, 'event1 상태 2개(Going/Waitlist) 아님');
+  assert.deepStrictEqual(ev1.statuses.find((s) => s.status === 'Going').members, ['Alice', 'Bob']);
+});
+
+check('buildTimeSlotPayload: 날짜 정렬 + TBD 플래그 + 상태 정규화 순서', () => {
+  const p = buildTimeSlotPayload(tsRows);
+  assert.deepStrictEqual(p.dates, ['2026-07-27', '2026-07-28'], '날짜 정렬 오류(null 제외)');
+  assert.strictEqual(p.hasTBD, true, '시간/날짜 미정 이벤트 플래그 누락');
+  // STATUS_VALUES 순서(Going이 Waitlist보다 앞)
+  assert.deepStrictEqual(p.statuses, ['Going', 'Waitlist'], '상태 정규화 순서 오류');
+});
+
+check('buildTimeSlotPayload: javascript: 스킴 링크는 차단하고 http(s)만 통과', () => {
+  const p = buildTimeSlotPayload(tsRows);
+  assert.strictEqual(p.events.find((e) => e.id === 1).url, null, 'javascript: 링크가 통과됨');
+  assert.strictEqual(p.events.find((e) => e.id === 2).url, 'https://lu.ma/x', 'https 링크가 누락됨');
+});
+
+check('renderDashboard: 시간대 탭·컨테이너·임베드 JSON 포함', () => {
+  const html = renderDashboard({
+    summary: { students: 6, events: 4, applications: 12 },
+    eventRows: tsRows, studentRows: [], generatedAt: 'x',
+  });
+  for (const tab of ['overview', 'timeline', 'schedule', 'people']) {
+    assert.ok(html.includes(`data-tab="${tab}"`), `탭 ${tab} 누락`);
+  }
+  for (const id of ['dist-body', 'dist-filter', 'dist-date', 'tl-date', 'tl-body', 'ts-data']) {
+    assert.ok(html.includes(`id="${id}"`), `컨테이너 ${id} 누락`);
+  }
+});
+
+check('renderDashboard: 임베드 JSON이 </script> 조기 종료를 막음', () => {
+  const evil = [{
+    event_id: 9, title: 'X</script><img src=x onerror=alert(1)>', location: null,
+    luma_url: null, event_date: '2026-07-28', event_time: '10:00', status: 'Going', cnt: 1, members: ['Z'],
+  }];
+  const html = renderDashboard({
+    summary: { students: 1, events: 1, applications: 1 },
+    eventRows: evil, studentRows: [], generatedAt: 'x',
+  });
+  // JSON 블록에 raw </script>가 있으면 스크립트가 조기 종료돼 XSS가 된다
+  assert.ok(!html.includes('X</script>'), 'raw </script>가 임베드 JSON에 노출됨');
+  assert.ok(html.includes('\\u003c/script'), '위험 문자가 \\u003c로 이스케이프되지 않음');
 });
 
 (async () => {

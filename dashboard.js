@@ -1,6 +1,6 @@
 // 관리자 대시보드. 조회·렌더·HTTP 핸들러 모두 의존성을 인자로 받아 Slack 앱 없이 단독 테스트 가능.
 const crypto = require('crypto');
-const { weekdaySuffix } = require('./format');
+const { weekdaySuffix, STATUS_VALUES } = require('./format');
 
 // 길이가 달라도 timingSafeEqual이 던지지 않도록 해시로 비교한다.
 function tokenMatches(expected, provided) {
@@ -87,6 +87,52 @@ async function fetchDashboardData(pool) {
   };
 }
 
+// 이벤트×상태 행을 시간대 뷰용 페이로드로 접는다. 순수 함수라 단독 테스트 가능하고,
+// 브라우저가 이 JSON을 받아 분포/타임라인을 실시간으로 다시 그린다(새로고침 없이 필터).
+function buildTimeSlotPayload(eventRows) {
+  const byEvent = new Map();
+  const statusSet = new Set();
+  for (const r of eventRows) {
+    if (!byEvent.has(r.event_id)) {
+      byEvent.set(r.event_id, {
+        id: r.event_id,
+        date: r.event_date || null,
+        time: r.event_time || null,
+        title: r.title,
+        location: r.location || null,
+        // javascript: 같은 스킴이 클라이언트에서 링크로 실행되지 않도록 http(s)만 통과시킨다
+        url: /^https?:\/\//i.test(r.luma_url || '') ? r.luma_url : null,
+        statuses: [],
+      });
+    }
+    if (r.status) {
+      statusSet.add(r.status);
+      byEvent.get(r.event_id).statuses.push({
+        status: r.status,
+        cnt: r.cnt,
+        members: r.members || [],
+      });
+    }
+  }
+  const events = [...byEvent.values()];
+  const dateSet = new Set(events.map((e) => e.date));
+  const dates = [...dateSet].filter(Boolean).sort();
+  // 정규화된 상태 순서를 우선하고, 목록에 없는 값은 뒤에 알파벳순으로 붙인다
+  const statuses = [...statusSet].sort((a, b) => {
+    const ia = STATUS_VALUES.indexOf(a);
+    const ib = STATUS_VALUES.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
+  });
+  return { events, dates, hasTBD: dateSet.has(null), statuses };
+}
+
+// <script type="application/json"> 안에 안전하게 넣기 위한 직렬화.
+// '<'를 이스케이프하면 </script> 조기 종료와 <!-- 주입을 막을 수 있고, JSON.parse 결과는 동일하다.
+function jsonForScript(obj) {
+  return JSON.stringify(obj).replace(/[<\u2028\u2029]/g, (c) =>
+    "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+
 // 이벤트 제목·장소·호스트는 Luma에서 파싱한 외부 문자열이라 반드시 이스케이프한다.
 function escapeHtml(value) {
   return String(value ?? '')
@@ -124,6 +170,226 @@ code{background:var(--card);border:1px solid var(--line);border-radius:5px;paddi
 .who{color:var(--muted);font-size:13px}
 a{color:var(--accent)}
 .empty{color:var(--muted);padding:16px 0}
+.tabs{display:flex;gap:2px;flex-wrap:wrap;margin:20px 0 4px;border-bottom:1px solid var(--line)}
+.tab{background:none;border:0;color:var(--muted);font:inherit;font-size:14px;padding:8px 12px;
+  cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab:hover{color:var(--fg)}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+.tab-panel{padding-top:12px}
+body.js .tab-panel{display:none}
+body.js .tab-panel.active{display:block}
+.hint{color:var(--muted);font-size:13px;margin:0 0 12px}
+.filter{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 16px}
+.chip{display:inline-flex;align-items:center;gap:4px;background:var(--card);border:1px solid var(--line);
+  border-radius:999px;padding:3px 10px;font-size:13px;cursor:pointer;user-select:none}
+.controls{display:flex;align-items:center;gap:8px;margin:2px 0 14px;flex-wrap:wrap}
+select{font:inherit;font-size:14px;padding:5px 8px;background:var(--card);color:var(--fg);
+  border:1px solid var(--line);border-radius:8px}
+.bar-row{display:flex;align-items:center;gap:10px;margin:3px 0}
+.bar-label{width:52px;color:var(--muted);font-variant-numeric:tabular-nums;font-size:13px;text-align:right}
+.bar-track{flex:1;background:var(--card);border-radius:6px;height:18px;overflow:hidden}
+.bar-fill{height:100%;background:var(--accent);border-radius:6px;min-width:2px;transition:width .2s}
+.bar-val{width:40px;font-variant-numeric:tabular-nums;font-size:13px}
+.conflict{background:var(--card);border:1px solid var(--accent);border-radius:10px;padding:10px 12px;margin:4px 0 16px}
+.conflict strong{display:block;margin-bottom:4px}
+.tl-row{padding:10px 0;border-bottom:1px solid var(--line)}
+.tl-row.concurrent{border-left:3px solid var(--accent);padding-left:11px;margin-left:-14px}
+.tl-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tl-bar{display:flex;align-items:center;gap:10px;margin:6px 0 4px;max-width:520px}
+.tl-bar .bar-track{height:14px}
+.tl-tags{margin-top:2px}
+.flag{color:var(--accent);font-size:12px;white-space:nowrap}
+`;
+
+// 브라우저에서 실행되는 인터랙션 코드. 임베드된 JSON을 읽어 분포·타임라인을 다시 그린다.
+// 외부 문자열(제목/장소/참석자명)은 전부 textContent로만 넣어 DOM XSS를 원천 차단한다.
+// 바깥 템플릿 리터럴과 충돌하지 않도록 이 문자열 안에서는 백틱과 ${}를 쓰지 않는다.
+const CLIENT_JS = `
+(function () {
+  var data = JSON.parse(document.getElementById('ts-data').textContent);
+  var events = data.events, statuses = data.statuses, dates = data.dates, hasTBD = data.hasTBD;
+
+  function el(tag, cls, txt) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (txt != null) e.textContent = txt;
+    return e;
+  }
+  function hourOf(t) { return t ? parseInt(t.slice(0, 2), 10) : null; }
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  // ---- 탭 전환 ----
+  var tabs = [].slice.call(document.querySelectorAll('.tab'));
+  var panels = [].slice.call(document.querySelectorAll('.tab-panel'));
+  function activate(name) {
+    tabs.forEach(function (t) { t.classList.toggle('active', t.dataset.tab === name); });
+    panels.forEach(function (p) { p.classList.toggle('active', p.dataset.panel === name); });
+  }
+  tabs.forEach(function (t) { t.addEventListener('click', function () { activate(t.dataset.tab); }); });
+
+  // ---- View A: 시간대 분포 ----
+  var active = {};
+  statuses.forEach(function (s) { active[s] = true; });
+  var distBody = document.getElementById('dist-body');
+  var distFilter = document.getElementById('dist-filter');
+  var distDate = document.getElementById('dist-date');
+
+  function renderDist() {
+    var only = distDate.value;
+    var byHour = {}, maxv = 0, tbd = 0;
+    events.forEach(function (ev) {
+      if (only !== '__ALL__' && ev.date !== (only === '__TBD__' ? null : only)) return;
+      var sum = 0;
+      ev.statuses.forEach(function (st) { if (active[st.status]) sum += st.cnt; });
+      if (!sum) return;
+      var h = hourOf(ev.time);
+      if (h == null) { tbd += sum; return; }
+      byHour[h] = (byHour[h] || 0) + sum;
+      if (byHour[h] > maxv) maxv = byHour[h];
+    });
+    distBody.textContent = '';
+    var hours = Object.keys(byHour).map(Number).sort(function (a, b) { return a - b; });
+    if (!hours.length) {
+      distBody.appendChild(el('p', 'empty', 'No attendees for the selected filters.'));
+      return;
+    }
+    hours.forEach(function (h) {
+      var row = el('div', 'bar-row');
+      row.appendChild(el('span', 'bar-label', pad2(h) + ':00'));
+      var track = el('div', 'bar-track');
+      var fill = el('div', 'bar-fill');
+      fill.style.width = (maxv ? byHour[h] / maxv * 100 : 0) + '%';
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.appendChild(el('span', 'bar-val', byHour[h]));
+      distBody.appendChild(row);
+    });
+    if (tbd) distBody.appendChild(el('p', 'who', 'Time TBD: ' + tbd));
+  }
+
+  statuses.forEach(function (s) {
+    var lab = el('label', 'chip');
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.addEventListener('change', function () { active[s] = cb.checked; renderDist(); });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(s));
+    distFilter.appendChild(lab);
+  });
+  var optAll = document.createElement('option');
+  optAll.value = '__ALL__';
+  optAll.textContent = 'All dates';
+  distDate.appendChild(optAll);
+  dates.forEach(function (d) {
+    var o = document.createElement('option');
+    o.value = d; o.textContent = d;
+    distDate.appendChild(o);
+  });
+  if (hasTBD) {
+    var oT = document.createElement('option');
+    oT.value = '__TBD__'; oT.textContent = 'Date TBD';
+    distDate.appendChild(oT);
+  }
+  distDate.addEventListener('change', renderDist);
+
+  // ---- View B: 날짜별 타임라인 ----
+  var tlSelect = document.getElementById('tl-date');
+  var tlBody = document.getElementById('tl-body');
+  var tlDates = dates.slice();
+  if (hasTBD) tlDates.push('__TBD__');
+  tlDates.forEach(function (d) {
+    var o = document.createElement('option');
+    o.value = d;
+    o.textContent = d === '__TBD__' ? 'Date TBD' : d;
+    tlSelect.appendChild(o);
+  });
+
+  function eventsForDate(d) {
+    var want = d === '__TBD__' ? null : d;
+    return events.filter(function (ev) { return ev.date === want; })
+      .sort(function (a, b) {
+        return (a.time || '~').localeCompare(b.time || '~') || a.title.localeCompare(b.title);
+      });
+  }
+  function goingMembers(ev) {
+    var m = [];
+    ev.statuses.forEach(function (st) { if (st.status === 'Going') m = m.concat(st.members); });
+    return m;
+  }
+  function renderTimeline() {
+    var evs = eventsForDate(tlSelect.value);
+    tlBody.textContent = '';
+    if (!evs.length) { tlBody.appendChild(el('p', 'empty', 'No events on this date.')); return; }
+
+    var byTime = {};
+    evs.forEach(function (ev) { var k = ev.time || 'TBD'; (byTime[k] = byTime[k] || []).push(ev); });
+
+    // 같은 시각에 Going이 겹치는 사람(개인 일정 충돌)
+    var conflicts = [];
+    Object.keys(byTime).forEach(function (t) {
+      if (byTime[t].length < 2) return;
+      var seen = {};
+      byTime[t].forEach(function (ev) {
+        goingMembers(ev).forEach(function (m) { (seen[m] = seen[m] || []).push(ev.title); });
+      });
+      Object.keys(seen).forEach(function (m) {
+        if (seen[m].length > 1) conflicts.push({ who: m, time: t, titles: seen[m] });
+      });
+    });
+    if (conflicts.length) {
+      var warn = el('div', 'conflict');
+      warn.appendChild(el('strong', null, 'Time conflicts (' + conflicts.length + ')'));
+      conflicts.forEach(function (c) {
+        warn.appendChild(el('div', 'who', c.who + '  ' + c.time + ' : ' + c.titles.join(' / ')));
+      });
+      tlBody.appendChild(warn);
+    }
+
+    var maxTotal = 0;
+    evs.forEach(function (ev) {
+      var tot = 0;
+      ev.statuses.forEach(function (st) { tot += st.cnt; });
+      ev._tot = tot;
+      if (tot > maxTotal) maxTotal = tot;
+    });
+    evs.forEach(function (ev) {
+      var concurrent = byTime[ev.time || 'TBD'].length > 1;
+      var row = el('div', 'tl-row' + (concurrent ? ' concurrent' : ''));
+      var head = el('div', 'tl-head');
+      head.appendChild(el('code', null, ev.time || 'TBD'));
+      if (ev.url) {
+        var a = el('a', null, ev.title);
+        a.href = ev.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+        head.appendChild(a);
+      } else {
+        head.appendChild(el('span', null, ev.title));
+      }
+      if (concurrent) head.appendChild(el('span', 'flag', 'concurrent'));
+      row.appendChild(head);
+      if (ev.location) row.appendChild(el('div', 'who', ev.location));
+
+      var bar = el('div', 'tl-bar');
+      var track = el('div', 'bar-track');
+      var fill = el('div', 'bar-fill');
+      fill.style.width = (maxTotal ? ev._tot / maxTotal * 100 : 0) + '%';
+      track.appendChild(fill);
+      bar.appendChild(track);
+      bar.appendChild(el('span', 'bar-val', ev._tot));
+      row.appendChild(bar);
+
+      var tags = el('div', 'tl-tags');
+      ev.statuses.forEach(function (st) { tags.appendChild(el('span', 'tag', st.status + ' ' + st.cnt)); });
+      row.appendChild(tags);
+      tlBody.appendChild(row);
+    });
+  }
+  tlSelect.addEventListener('change', renderTimeline);
+
+  renderDist();
+  renderTimeline();
+  activate('overview');
+})();
 `;
 
 // 이벤트 행(이벤트×상태)을 날짜별로 묶어 타임라인 테이블로 만든다.
@@ -198,6 +464,7 @@ function renderStudents(studentRows) {
 }
 
 function renderDashboard({ summary, eventRows, studentRows, generatedAt }) {
+  const payload = buildTimeSlotPayload(eventRows);
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -215,15 +482,45 @@ function renderDashboard({ summary, eventRows, studentRows, generatedAt }) {
   <div class="card"><div class="n">${summary.applications}</div><div class="l">Registrations</div></div>
 </div>
 
-<h2>Schedule by date</h2>
-${renderEventsByDate(eventRows)}
+<div class="tabs" role="tablist">
+  <button class="tab" data-tab="overview">By time slot</button>
+  <button class="tab" data-tab="timeline">Timeline</button>
+  <button class="tab" data-tab="schedule">Schedule</button>
+  <button class="tab" data-tab="people">People</button>
+</div>
 
-<h2>Registrations by person</h2>
+<section class="tab-panel" data-panel="overview">
+  <p class="hint">Total attendees per hour, summed across the selected dates and statuses.</p>
+  <div class="controls">
+    <label for="dist-date">Date</label><select id="dist-date"></select>
+  </div>
+  <div class="filter" id="dist-filter"></div>
+  <div id="dist-body"></div>
+</section>
+
+<section class="tab-panel" data-panel="timeline">
+  <p class="hint">Events on a single day in time order. Concurrent slots are highlighted, and people going to two events at the same time are listed as conflicts.</p>
+  <div class="controls">
+    <label for="tl-date">Date</label><select id="tl-date"></select>
+  </div>
+  <div id="tl-body"></div>
+</section>
+
+<section class="tab-panel" data-panel="schedule">
+${renderEventsByDate(eventRows)}
+</section>
+
+<section class="tab-panel" data-panel="people">
 ${renderStudents(studentRows)}
+</section>
+
+<script type="application/json" id="ts-data">${jsonForScript(payload)}</script>
+<script>document.body.classList.add('js');</script>
+<script>${CLIENT_JS}</script>
 </div></body></html>`;
 }
 
 module.exports = {
-  createAdminHandler, tokenMatches, fetchDashboardData,
+  createAdminHandler, tokenMatches, fetchDashboardData, buildTimeSlotPayload,
   renderDashboard, renderEventsByDate, renderStudents, escapeHtml,
 };
