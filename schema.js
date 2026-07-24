@@ -49,6 +49,9 @@ async function initSchema(pool) {
     FOR EACH ROW EXECUTE FUNCTION update_student_counts();
   `);
 
+  // 대시보드는 Slack 렌더링(<@ID>)을 못 쓰므로 표시 이름을 따로 보관한다.
+  await pool.query(`ALTER TABLE students ADD COLUMN IF NOT EXISTS display_name TEXT`);
+
   await migrateDedupKey(pool);
   await migrateStatusesToEnglish(pool);
 

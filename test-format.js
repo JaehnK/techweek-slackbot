@@ -165,5 +165,52 @@ check('dedupKey: 날짜가 다르면 다른 키', () => {
   assert.notStrictEqual(dedupKey('A', '2026-07-29'), dedupKey('A', '2026-07-30'));
 });
 
+
+// ---------- 관리자 대시보드 ----------
+const { renderDashboard, escapeHtml } = require('./dashboard');
+
+check('escapeHtml: HTML 특수문자 이스케이프', () => {
+  assert.strictEqual(escapeHtml(`<script>"&'`), '&lt;script&gt;&quot;&amp;&#39;');
+  assert.strictEqual(escapeHtml(null), '');
+});
+
+check('renderDashboard: 이벤트 제목의 XSS가 이스케이프됨', () => {
+  // 제목/장소는 Luma에서 파싱한 외부 문자열이라 그대로 넣으면 스크립트가 실행된다
+  const html = renderDashboard({
+    summary: { students: 1, events: 1, applications: 1 },
+    eventRows: [{
+      event_id: 1, title: '<img src=x onerror=alert(1)>', location: '<b>loc</b>', luma_url: null,
+      event_date: '2026-07-27', event_time: '15:30', status: 'Going', cnt: 1, members: ['<script>'],
+    }],
+    studentRows: [{ student_id: 1, label: 'Alice', slack_id: 'U1', status: 'Going', cnt: 1, total: 1 }],
+    generatedAt: '2026-07-22 00:00 UTC',
+  });
+  assert.ok(!html.includes('<img src=x'), '제목이 이스케이프되지 않음');
+  assert.ok(!html.includes('<script>'), '참석자명이 이스케이프되지 않음');
+  assert.ok(html.includes('&lt;img src=x'), '이스케이프된 제목이 없음');
+  assert.ok(html.includes('2026-07-27 (Mon)'), '날짜/요일 표기 없음');
+});
+
+check('renderDashboard: 요약 수치와 빈 상태', () => {
+  const html = renderDashboard({
+    summary: { students: 6, events: 12, applications: 30 },
+    eventRows: [], studentRows: [], generatedAt: 'x',
+  });
+  assert.ok(html.includes('>6<') && html.includes('>12<') && html.includes('>30<'), '요약 수치 누락');
+  assert.ok(html.includes('No events yet.'), '이벤트 빈 상태 문구 없음');
+  assert.ok(html.includes('No one has registered'), '학생 빈 상태 문구 없음');
+});
+
+check('renderDashboard: 표시 이름이 없으면 Slack ID 중복 표기 안 함', () => {
+  const html = renderDashboard({
+    summary: { students: 1, events: 0, applications: 0 },
+    eventRows: [],
+    studentRows: [{ student_id: 1, label: 'U9', slack_id: 'U9', status: null, cnt: 0, total: 0 }],
+    generatedAt: 'x',
+  });
+  assert.strictEqual(html.split('U9').length - 1, 1, 'Slack ID가 중복 표기됨');
+  assert.ok(html.includes('no registrations'), '0건 표기 없음');
+});
+
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail === 0 ? 0 : 1);
