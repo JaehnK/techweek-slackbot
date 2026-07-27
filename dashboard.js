@@ -156,6 +156,16 @@ function jsonForScript(obj) {
     "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
 }
 
+// 상태값을 색상 클래스 슬러그로. 정규화 값이 바뀌어도 접두어 매칭이라 잘 견딘다.
+function statusSlug(status) {
+  const s = String(status || '').toLowerCase();
+  if (s.startsWith('going')) return 'going';
+  if (s.startsWith('pending')) return 'pending';
+  if (s.startsWith('wait')) return 'waitlist';
+  if (s.startsWith('invit')) return 'invited';
+  return 'unknown';
+}
+
 // 이벤트 제목·장소·호스트는 Luma에서 파싱한 외부 문자열이라 반드시 이스케이프한다.
 function escapeHtml(value) {
   return String(value ?? '')
@@ -167,32 +177,46 @@ function escapeHtml(value) {
 }
 
 const STYLE = `
-:root{color-scheme:light dark;--bg:#fff;--fg:#1a1a1a;--muted:#666;--line:#e5e5e5;--card:#f7f7f8;--accent:#2f6feb}
-@media (prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e8e8ea;--muted:#9aa0a6;--line:#2a2e35;--card:#1c1f25;--accent:#6ea8ff}}
+:root{color-scheme:light dark;--bg:#fff;--fg:#1a1a1a;--muted:#5c6470;--line:#e6e8ec;--card:#f6f7f9;--hover:#f0f2f5;--accent:#2f6feb}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--fg:#e8e8ea;--muted:#9aa0a6;--line:#272b33;--card:#1a1d23;--hover:#1f232a;--accent:#6ea8ff}}
 *{box-sizing:border-box}
-body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
-  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Apple SD Gothic Neo","Noto Sans KR",sans-serif}
-.wrap{max-width:1100px;margin:0 auto}
-h1{font-size:22px;margin:0 0 4px}
-h2{font-size:17px;margin:32px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line)}
-.meta{color:var(--muted);font-size:13px;margin-bottom:20px}
-.cards{display:flex;gap:12px;flex-wrap:wrap}
-.card{flex:1 1 150px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
-.card .n{font-size:26px;font-weight:700;line-height:1.2}
-.card .l{color:var(--muted);font-size:13px}
-.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
-table{border-collapse:collapse;width:100%;font-size:14px;min-width:640px}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
-td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.day{margin:22px 0 8px;font-weight:700}
-code{background:var(--card);border:1px solid var(--line);border-radius:5px;padding:1px 6px;
-  font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
-.tag{display:inline-block;background:var(--card);border:1px solid var(--line);border-radius:999px;
-  padding:1px 9px;font-size:12px;margin:0 4px 4px 0;white-space:nowrap}
-.who{color:var(--muted);font-size:13px}
-a{color:var(--accent)}
-.empty{color:var(--muted);padding:16px 0}
+body{margin:0;padding:28px 24px 64px;background:var(--bg);color:var(--fg);
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Apple SD Gothic Neo","Noto Sans KR",sans-serif}
+.wrap{max-width:1040px;margin:0 auto}
+h1{font-size:25px;font-weight:700;letter-spacing:-.01em;margin:0 0 4px}
+h2{font-size:16px;font-weight:700;letter-spacing:.01em;margin:34px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+.meta{color:var(--muted);font-size:13px;margin-bottom:24px}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+.card{flex:1 1 150px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card .n{font-size:30px;font-weight:750;line-height:1.1;letter-spacing:-.02em}
+.card .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-top:2px}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:12px}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:600px}
+th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--hover)}
+thead th{position:sticky;top:0;background:var(--bg);color:var(--muted);font-weight:600;font-size:11px;
+  text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600}
+.day{margin:26px 0 10px;font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px}
+.day::before{content:"";width:4px;height:15px;border-radius:2px;background:var(--accent);display:inline-block}
+code{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:2px 7px;
+  font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+.brk{margin:2px 0}
+.tag{--tc:var(--muted);display:inline-block;border-radius:999px;padding:2px 10px;font-size:12px;
+  font-weight:600;margin:0 5px 5px 0;white-space:nowrap;color:var(--tc);
+  background:color-mix(in srgb,var(--tc) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--tc) 34%,transparent)}
+.st-going{--tc:#137333}.st-pending{--tc:#a15c00}.st-waitlist{--tc:#4f46e5}
+.st-invited{--tc:#0e7490}.st-unknown{--tc:#6b7280}
+@media (prefers-color-scheme:dark){
+  .st-going{--tc:#4ade80}.st-pending{--tc:#fbbf24}.st-waitlist{--tc:#a5b4fc}
+  .st-invited{--tc:#67e8f9}.st-unknown{--tc:#9aa0a6}}
+.who{color:var(--muted);font-size:13px;line-height:1.5}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.empty{color:var(--muted);padding:20px 0}
 .tabs{display:flex;gap:2px;flex-wrap:wrap;margin:20px 0 4px;border-bottom:1px solid var(--line)}
 .tab{background:none;border:0;color:var(--muted);font:inherit;font-size:14px;padding:8px 12px;
   cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
@@ -252,6 +276,14 @@ const CLIENT_JS = `
   }
   function hourOf(t) { return t ? parseInt(t.slice(0, 2), 10) : null; }
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function statusSlug(s) {
+    s = (s || '').toLowerCase();
+    if (s.indexOf('going') === 0) return 'going';
+    if (s.indexOf('pending') === 0) return 'pending';
+    if (s.indexOf('wait') === 0) return 'waitlist';
+    if (s.indexOf('invit') === 0) return 'invited';
+    return 'unknown';
+  }
 
   // 상태 태그에 커서를 올리면 참석자 명단을 띄우는 공용 툴팁.
   // 이름은 외부 문자열이라 textContent로만 넣는다(속성/innerHTML 미사용).
@@ -438,9 +470,10 @@ const CLIENT_JS = `
 
       var tags = el('div', 'tl-tags');
       ev.statuses.forEach(function (st) {
-        var tag = el('span', 'tag', st.status + ' ' + st.cnt);
+        var cls = 'tag st-' + statusSlug(st.status);
+        var tag = el('span', cls, st.status + ' ' + st.cnt);
         if (st.members && st.members.length) {
-          tag.className = 'tag has-members';
+          tag.className = cls + ' has-members';
           attachTip(tag, st.status, st.members);
         }
         tags.appendChild(tag);
@@ -488,7 +521,7 @@ function renderEventsByDate(eventRows) {
       const where = ev.location ? `<div class="who">${escapeHtml(ev.location)}</div>` : '';
       const breakdown = ev.statuses.map((s) => {
         const who = (s.members || []).map((m) => escapeHtml(m)).join(', ');
-        return `<div><span class="tag">${escapeHtml(s.status)} ${s.cnt}</span>`
+        return `<div class="brk"><span class="tag st-${statusSlug(s.status)}">${escapeHtml(s.status)} ${s.cnt}</span>`
           + `<span class="who">${who}</span></div>`;
       }).join('');
       html += `<tr><td><code>${escapeHtml(ev.time || 'TBD')}</code></td>`
@@ -518,7 +551,7 @@ function renderStudents(studentRows) {
     + '<th>Person</th><th class="num">Total</th><th>Breakdown</th></tr></thead><tbody>';
   for (const st of byStudent.values()) {
     const breakdown = st.statuses.length
-      ? st.statuses.map((s) => `<span class="tag">${escapeHtml(s.status)} ${s.cnt}</span>`).join('')
+      ? st.statuses.map((s) => `<span class="tag st-${statusSlug(s.status)}">${escapeHtml(s.status)} ${s.cnt}</span>`).join('')
       : '<span class="who">no registrations</span>';
     // 표시 이름을 못 받아온 경우 label이 곧 Slack ID이므로 중복 표기하지 않는다
     const sub = st.label === st.slackId ? '' : `<div class="who">${escapeHtml(st.slackId)}</div>`;
