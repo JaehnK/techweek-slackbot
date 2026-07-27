@@ -203,6 +203,12 @@ body.js .tab-panel{display:none}
 body.js .tab-panel.active{display:block}
 .hint{color:var(--muted);font-size:13px;margin:0 0 12px}
 .subhead{font-weight:700;margin:24px 0 6px}
+.grp{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;margin:16px 0 8px}
+.people-grid{display:flex;flex-wrap:wrap;gap:8px}
+.person{display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);
+  border-radius:8px;padding:6px 11px;font-size:14px}
+.person .badge{color:var(--accent);font-size:11px;font-weight:600;border:1px solid var(--accent);
+  border-radius:5px;padding:0 5px;line-height:1.5}
 .filter{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 16px}
 .chip{display:inline-flex;align-items:center;gap:4px;background:var(--card);border:1px solid var(--line);
   border-radius:999px;padding:3px 10px;font-size:13px;cursor:pointer;user-select:none}
@@ -523,6 +529,7 @@ function renderStudents(studentRows) {
 }
 
 // 미등록 교육생 목록. unregistered가 null이면 로스터를 못 받은 것(스코프/네트워크)이라 그걸 알린다.
+// 읽기 쉽도록 캠퍼스별로 묶고, 중복되는 _42 접미사는 떼서 사람 이름만 칩으로 보여준다.
 function renderUnregistered(unregistered) {
   if (unregistered == null) {
     return '<div class="subhead">Not registered</div>'
@@ -532,14 +539,31 @@ function renderUnregistered(unregistered) {
     return '<div class="subhead">Not registered — 0</div>'
       + '<p class="who">Everyone in the cohort has registered a schedule.</p>';
   }
-  const items = unregistered.map((u) => {
-    const alt = u.alt
-      ? '<span class="who"> · same name already registered (possible alt account)</span>'
-      : '';
-    return `<div>${escapeHtml(u.name)}${alt}</div>`;
-  }).join('');
+
+  // 캠퍼스별로 분류하고 접미사를 제거한다
+  const groups = { Seoul: [], Gyeongsan: [], Other: [] };
+  for (const u of unregistered) {
+    const m = /_?42\s*(seoul|gyeongsan)/i.exec(u.name);
+    const campus = m ? m[1][0].toUpperCase() + m[1].slice(1).toLowerCase() : null;
+    const person = u.name.replace(/_?42\s*(seoul|gyeongsan)/i, '').replace(/[_\s]+$/, '').trim() || u.name;
+    (campus && groups[campus] ? groups[campus] : groups.Other).push({ person, alt: u.alt, ids: u.ids });
+  }
+
+  const chip = (p) => {
+    const badges = (p.ids && p.ids.length > 1 ? `<span class="badge">×${p.ids.length}</span>` : '')
+      + (p.alt ? '<span class="badge" title="Same name already registered under another ID">alt?</span>' : '');
+    return `<span class="person">${escapeHtml(p.person)}${badges}</span>`;
+  };
+  const section = (label, list) => (list.length
+    ? `<div class="grp">${label} · ${list.length}</div>`
+      + `<div class="people-grid">${list.map(chip).join('')}</div>`
+    : '');
+
   return `<div class="subhead">Not registered — ${unregistered.length}</div>`
-    + `<p class="hint">Cohort members (42 campuses) with no schedule in the bot yet.</p>${items}`;
+    + '<p class="hint">Cohort members (42 campuses) with no schedule in the bot yet.</p>'
+    + section('42 Seoul', groups.Seoul)
+    + section('42 Gyeongsan', groups.Gyeongsan)
+    + section('Other', groups.Other);
 }
 
 function renderDashboard({ summary, eventRows, studentRows, unregistered, generatedAt }) {

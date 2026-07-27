@@ -386,10 +386,11 @@ check('renderDashboard: People 탭에 미등록 목록/안내가 렌더됨', () 
   assert.ok(renderDashboard(base).includes('Roster unavailable'), '로스터 없음 안내 누락');
   // 빈 배열 → 전원 등록 문구
   assert.ok(renderDashboard({ ...base, unregistered: [] }).includes('Everyone in the cohort'), '전원 등록 문구 누락');
-  // 목록 있음 → 이름과 카운트
+  // 목록 있음 → 캠퍼스 그룹 + 접미사 제거된 이름 + 카운트
   const html = renderDashboard({ ...base, unregistered: [{ name: 'Alice Kim_42Seoul', ids: ['U_A'], alt: false }] });
   assert.ok(html.includes('Not registered — 1'), '미등록 카운트 누락');
-  assert.ok(html.includes('Alice Kim_42Seoul'), '미등록 이름 누락');
+  assert.ok(html.includes('42 Seoul · 1'), '캠퍼스 그룹 헤더 누락');
+  assert.ok(html.includes('>Alice Kim<'), '접미사 제거된 이름 칩 누락');
 });
 
 check('renderUnregistered: 이름이 이스케이프됨', () => {
