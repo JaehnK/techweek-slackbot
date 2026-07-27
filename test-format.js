@@ -174,7 +174,7 @@ check('dedupKey: 날짜가 다르면 다른 키', () => {
 // ---------- 관리자 대시보드 ----------
 const {
   renderDashboard, escapeHtml, tokenMatches, createAdminHandler, buildTimeSlotPayload,
-  computeUnregistered,
+  computeUnregistered, renderStudents,
 } = require('./dashboard');
 
 // 응답을 받아 적는 최소 http.ServerResponse 대역
@@ -352,6 +352,29 @@ check('renderDashboard: 임베드 JSON이 </script> 조기 종료를 막음', ()
   // JSON 블록에 raw </script>가 있으면 스크립트가 조기 종료돼 XSS가 된다
   assert.ok(!html.includes('X</script>'), 'raw </script>가 임베드 JSON에 노출됨');
   assert.ok(html.includes('\\u003c/script'), '위험 문자가 \\u003c로 이스케이프되지 않음');
+});
+
+check('renderStudents: 사람을 펼치면 신청 스케줄이 일별로 정리됨(아코디언)', () => {
+  const studentRows = [
+    { student_id: 1, label: 'Alice_42Seoul', slack_id: 'U1', status: 'Going', cnt: 1, total: 2 },
+    { student_id: 1, label: 'Alice_42Seoul', slack_id: 'U1', status: 'Waitlist', cnt: 1, total: 2 },
+  ];
+  const studentEventRows = [
+    { student_id: 1, event_date: '2026-07-27', event_time: '10:00', title: 'AI Talk', location: 'Hall', luma_url: 'https://lu.ma/a', status: 'Going' },
+    { student_id: 1, event_date: '2026-07-28', event_time: '09:00', title: 'Robotics', location: null, luma_url: 'javascript:alert(1)', status: 'Waitlist' },
+  ];
+  const html = renderStudents(studentRows, studentEventRows);
+  assert.ok(html.includes('<details'), '아코디언(details) 아님');
+  assert.ok(html.includes('2026-07-27 (Mon)') && html.includes('2026-07-28 (Tue)'), '일별 그룹 헤더 없음');
+  assert.ok(html.includes('AI Talk') && html.includes('Robotics'), '이벤트 제목 누락');
+  assert.ok(html.includes('href="https://lu.ma/a"'), '정상 http 링크 누락');
+  assert.ok(!html.includes('href="javascript:'), 'javascript: 링크가 href로 렌더됨');
+});
+
+check('renderStudents: 스케줄이 없어도(구 시그니처) 깨지지 않고 no registrations 표기', () => {
+  const html = renderStudents([{ student_id: 9, label: 'U9', slack_id: 'U9', status: null, cnt: 0, total: 0 }]);
+  assert.strictEqual(html.split('U9').length - 1, 1, 'Slack ID 중복 표기');
+  assert.ok(html.includes('no registrations'), '0건 표기 없음');
 });
 
 // ---------- 미등록 교육생 ----------

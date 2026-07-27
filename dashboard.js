@@ -44,7 +44,7 @@ function createAdminHandler({ token, buildHtml }) {
 
 // 대시보드가 쓰는 세 갈래 집계. 서로 독립이라 병렬로 던진다.
 async function fetchDashboardData(pool) {
-  const [summary, events, students] = await Promise.all([
+  const [summary, events, students, studentEvents] = await Promise.all([
     pool.query(`
       SELECT (SELECT COUNT(*) FROM students)::int     AS students,
              (SELECT COUNT(*) FROM events)::int       AS events,
@@ -78,12 +78,23 @@ async function fetchDashboardData(pool) {
       GROUP BY s.id, s.display_name, s.name, a.status
       ORDER BY total DESC, label, a.status
     `),
+    // 사람별 신청 내역(이벤트 단위). People 탭에서 사람을 펼치면 일별로 보여준다.
+    pool.query(`
+      SELECT a.student_id,
+             TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+             TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
+             e.title, e.location, e.luma_url, a.status
+      FROM applications a
+      JOIN events e ON e.id = a.event_id
+      ORDER BY a.student_id, e.event_date NULLS LAST, e.event_time NULLS LAST, e.title
+    `),
   ]);
 
   return {
     summary: summary.rows[0],
     eventRows: events.rows,
     studentRows: students.rows,
+    studentEventRows: studentEvents.rows,
   };
 }
 
@@ -156,6 +167,11 @@ function jsonForScript(obj) {
     "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
 }
 
+// href에 넣어도 안전한 URL만 통과시킨다(javascript: 등 스킴 차단). 아니면 null.
+function safeUrl(u) {
+  return /^https?:\/\//i.test(u || '') ? u : null;
+}
+
 // 상태값을 색상 클래스 슬러그로. 정규화 값이 바뀌어도 접두어 매칭이라 잘 견딘다.
 function statusSlug(status) {
   const s = String(status || '').toLowerCase();
@@ -214,6 +230,22 @@ code{background:var(--card);border:1px solid var(--line);border-radius:6px;paddi
   .st-going{--tc:#4ade80}.st-pending{--tc:#fbbf24}.st-waitlist{--tc:#a5b4fc}
   .st-invited{--tc:#67e8f9}.st-unknown{--tc:#9aa0a6}}
 .who{color:var(--muted);font-size:13px;line-height:1.5}
+.acc{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.acc-item{border-bottom:1px solid var(--line)}
+.acc-item:last-child{border-bottom:0}
+.acc-sum{list-style:none;cursor:pointer;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 16px}
+.acc-sum::-webkit-details-marker{display:none}
+.acc-sum::before{content:"\\25B8";color:var(--muted);font-size:12px;transition:transform .15s;flex:0 0 auto}
+details[open] .acc-sum::before{transform:rotate(90deg)}
+.acc-sum:hover{background:var(--hover)}
+.acc-name{flex:1 1 180px;font-weight:600;display:flex;flex-direction:column;gap:1px;min-width:0}
+.acc-name .who{font-weight:400}
+.acc-total{font-variant-numeric:tabular-nums;font-weight:700;min-width:26px;text-align:right}
+.acc-tags{display:flex;flex-wrap:wrap;gap:0;justify-content:flex-end;align-items:center}
+.acc-body{padding:2px 16px 16px 40px;background:var(--card)}
+.acc-body .day{margin:14px 0 6px}
+.ev{display:flex;align-items:baseline;gap:10px;padding:4px 0}
+.ev-title{flex:1;min-width:0}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
 .empty{color:var(--muted);padding:20px 0}
@@ -515,8 +547,9 @@ function renderEventsByDate(eventRows) {
       + '<th>Time</th><th>Event</th><th class="num">Total</th><th>Breakdown</th></tr></thead><tbody>';
     for (const ev of events.values()) {
       const total = ev.statuses.reduce((sum, s) => sum + s.cnt, 0);
-      const title = ev.luma_url
-        ? `<a href="${escapeHtml(ev.luma_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(ev.title)}</a>`
+      const url = safeUrl(ev.luma_url);
+      const title = url
+        ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(ev.title)}</a>`
         : escapeHtml(ev.title);
       const where = ev.location ? `<div class="who">${escapeHtml(ev.location)}</div>` : '';
       const breakdown = ev.statuses.map((s) => {
@@ -532,8 +565,34 @@ function renderEventsByDate(eventRows) {
   return html;
 }
 
-// 학생 행(학생×상태)을 사람별 요약 테이블로 만든다.
-function renderStudents(studentRows) {
+// 한 사람의 신청 내역을 일별로 묶어 렌더한다(아코디언 본문).
+function renderPersonSchedule(events) {
+  if (!events || !events.length) return '<p class="who">no registrations</p>';
+  const byDate = new Map();
+  for (const e of events) {
+    const key = e.event_date || 'Date TBD';
+    if (!byDate.has(key)) byDate.set(key, []);
+    byDate.get(key).push(e);
+  }
+  let html = '';
+  for (const [date, evs] of byDate) {
+    html += `<div class="day">${escapeHtml(date)}${escapeHtml(weekdaySuffix(date))}</div>`;
+    for (const e of evs) {
+      const url = safeUrl(e.luma_url);
+      const title = url
+        ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(e.title)}</a>`
+        : escapeHtml(e.title);
+      const loc = e.location ? `<span class="who"> · ${escapeHtml(e.location)}</span>` : '';
+      html += `<div class="ev"><code>${escapeHtml(e.event_time || 'TBD')}</code>`
+        + `<span class="ev-title">${title}${loc}</span>`
+        + `<span class="tag st-${statusSlug(e.status)}">${escapeHtml(e.status)}</span></div>`;
+    }
+  }
+  return html;
+}
+
+// 학생 행(학생×상태)을 사람별 아코디언으로 만든다. 헤더를 누르면 신청 스케줄이 일별로 펼쳐진다.
+function renderStudents(studentRows, studentEventRows = []) {
   const byStudent = new Map();
   for (const r of studentRows) {
     if (!byStudent.has(r.student_id)) {
@@ -547,18 +606,27 @@ function renderStudents(studentRows) {
 
   if (!byStudent.size) return '<p class="empty">No one has registered a schedule yet.</p>';
 
-  let html = '<div class="scroll"><table><thead><tr>'
-    + '<th>Person</th><th class="num">Total</th><th>Breakdown</th></tr></thead><tbody>';
-  for (const st of byStudent.values()) {
-    const breakdown = st.statuses.length
+  const eventsByStudent = new Map();
+  for (const r of studentEventRows || []) {
+    if (!eventsByStudent.has(r.student_id)) eventsByStudent.set(r.student_id, []);
+    eventsByStudent.get(r.student_id).push(r);
+  }
+
+  let html = '<div class="acc">';
+  for (const [id, st] of byStudent) {
+    const tags = st.statuses.length
       ? st.statuses.map((s) => `<span class="tag st-${statusSlug(s.status)}">${escapeHtml(s.status)} ${s.cnt}</span>`).join('')
       : '<span class="who">no registrations</span>';
     // 표시 이름을 못 받아온 경우 label이 곧 Slack ID이므로 중복 표기하지 않는다
-    const sub = st.label === st.slackId ? '' : `<div class="who">${escapeHtml(st.slackId)}</div>`;
-    html += `<tr><td>${escapeHtml(st.label)}${sub}</td>`
-      + `<td class="num">${st.total}</td><td>${breakdown}</td></tr>`;
+    const sub = st.label === st.slackId ? '' : `<span class="who">${escapeHtml(st.slackId)}</span>`;
+    html += '<details class="acc-item"><summary class="acc-sum">'
+      + `<span class="acc-name">${escapeHtml(st.label)}${sub}</span>`
+      + `<span class="acc-total">${st.total}</span>`
+      + `<span class="acc-tags">${tags}</span></summary>`
+      + `<div class="acc-body">${renderPersonSchedule(eventsByStudent.get(id))}</div>`
+      + '</details>';
   }
-  return `${html}</tbody></table></div>`;
+  return `${html}</div>`;
 }
 
 // 미등록 교육생 목록. unregistered가 null이면 로스터를 못 받은 것(스코프/네트워크)이라 그걸 알린다.
@@ -599,7 +667,9 @@ function renderUnregistered(unregistered) {
     + section('Other', groups.Other);
 }
 
-function renderDashboard({ summary, eventRows, studentRows, unregistered, generatedAt }) {
+function renderDashboard({
+  summary, eventRows, studentRows, studentEventRows, unregistered, generatedAt,
+}) {
   const payload = buildTimeSlotPayload(eventRows);
   return `<!doctype html>
 <html lang="en"><head>
@@ -647,7 +717,7 @@ ${renderEventsByDate(eventRows)}
 </section>
 
 <section class="tab-panel" data-panel="people">
-${renderStudents(studentRows)}
+${renderStudents(studentRows, studentEventRows)}
 ${renderUnregistered(unregistered)}
 </section>
 
