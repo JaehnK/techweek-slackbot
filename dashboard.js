@@ -126,6 +126,29 @@ function buildTimeSlotPayload(eventRows) {
   return { events, dates, hasTBD: dateSet.has(null), statuses };
 }
 
+// 미등록자 산출용. 코호트(교육생) 판별은 42 캠퍼스 접미사로 한다. 운영/멘토(_IA, _GSIA,
+// 영문 이름 등)를 걸러내기 위한 휴리스틱이며, 기준이 바뀌면 이 정규식만 고치면 된다.
+const COHORT_RE = /_42\s*(seoul|gyeongsan)/i;
+function normName(s) { return String(s || '').toLowerCase().replace(/[\s_]+/g, ''); }
+
+// 워크스페이스 로스터에서 "코호트인데 봇에 등록 안 한 사람"을 뽑는다. 순수 함수.
+// - 등록 여부는 Slack 계정 ID로 대조한다(봇이 저장하는 키가 ID라서).
+// - 이름이 같은 중복 계정은 한 사람으로 합치되, 계정 ID는 모두 보존한다.
+// - 이름이 이미 등록자 명단에 있으면(다른 ID로 등록한 부계정 가능성) alt로 표시만 하고 목록에는 남긴다.
+function computeUnregistered({ rosterMembers, registeredIds, registeredNames }) {
+  const idSet = registeredIds instanceof Set ? registeredIds : new Set(registeredIds || []);
+  const nameSet = new Set((registeredNames || []).map(normName));
+  const byName = new Map();
+  for (const m of rosterMembers || []) {
+    if (!COHORT_RE.test(m.name)) continue;
+    if (idSet.has(m.id)) continue;
+    const key = normName(m.name);
+    if (!byName.has(key)) byName.set(key, { name: m.name, ids: [], alt: nameSet.has(key) });
+    byName.get(key).ids.push(m.id);
+  }
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 // <script type="application/json"> 안에 안전하게 넣기 위한 직렬화.
 // '<'를 이스케이프하면 </script> 조기 종료와 <!-- 주입을 막을 수 있고, JSON.parse 결과는 동일하다.
 function jsonForScript(obj) {
@@ -179,6 +202,7 @@ a{color:var(--accent)}
 body.js .tab-panel{display:none}
 body.js .tab-panel.active{display:block}
 .hint{color:var(--muted);font-size:13px;margin:0 0 12px}
+.subhead{font-weight:700;margin:24px 0 6px}
 .filter{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 16px}
 .chip{display:inline-flex;align-items:center;gap:4px;background:var(--card);border:1px solid var(--line);
   border-radius:999px;padding:3px 10px;font-size:13px;cursor:pointer;user-select:none}
@@ -498,7 +522,27 @@ function renderStudents(studentRows) {
   return `${html}</tbody></table></div>`;
 }
 
-function renderDashboard({ summary, eventRows, studentRows, generatedAt }) {
+// 미등록 교육생 목록. unregistered가 null이면 로스터를 못 받은 것(스코프/네트워크)이라 그걸 알린다.
+function renderUnregistered(unregistered) {
+  if (unregistered == null) {
+    return '<div class="subhead">Not registered</div>'
+      + '<p class="who">Roster unavailable — the bot needs the <code>users:read</code> scope to list who has not registered.</p>';
+  }
+  if (!unregistered.length) {
+    return '<div class="subhead">Not registered — 0</div>'
+      + '<p class="who">Everyone in the cohort has registered a schedule.</p>';
+  }
+  const items = unregistered.map((u) => {
+    const alt = u.alt
+      ? '<span class="who"> · same name already registered (possible alt account)</span>'
+      : '';
+    return `<div>${escapeHtml(u.name)}${alt}</div>`;
+  }).join('');
+  return `<div class="subhead">Not registered — ${unregistered.length}</div>`
+    + `<p class="hint">Cohort members (42 campuses) with no schedule in the bot yet.</p>${items}`;
+}
+
+function renderDashboard({ summary, eventRows, studentRows, unregistered, generatedAt }) {
   const payload = buildTimeSlotPayload(eventRows);
   return `<!doctype html>
 <html lang="en"><head>
@@ -547,6 +591,7 @@ ${renderEventsByDate(eventRows)}
 
 <section class="tab-panel" data-panel="people">
 ${renderStudents(studentRows)}
+${renderUnregistered(unregistered)}
 </section>
 
 <script type="application/json" id="ts-data">${jsonForScript(payload)}</script>
@@ -556,6 +601,6 @@ ${renderStudents(studentRows)}
 }
 
 module.exports = {
-  createAdminHandler, tokenMatches, fetchDashboardData, buildTimeSlotPayload,
-  renderDashboard, renderEventsByDate, renderStudents, escapeHtml,
+  createAdminHandler, tokenMatches, fetchDashboardData, buildTimeSlotPayload, computeUnregistered,
+  renderDashboard, renderEventsByDate, renderStudents, renderUnregistered, escapeHtml,
 };

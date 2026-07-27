@@ -174,6 +174,7 @@ check('dedupKey: 날짜가 다르면 다른 키', () => {
 // ---------- 관리자 대시보드 ----------
 const {
   renderDashboard, escapeHtml, tokenMatches, createAdminHandler, buildTimeSlotPayload,
+  computeUnregistered,
 } = require('./dashboard');
 
 // 응답을 받아 적는 최소 http.ServerResponse 대역
@@ -351,6 +352,53 @@ check('renderDashboard: 임베드 JSON이 </script> 조기 종료를 막음', ()
   // JSON 블록에 raw </script>가 있으면 스크립트가 조기 종료돼 XSS가 된다
   assert.ok(!html.includes('X</script>'), 'raw </script>가 임베드 JSON에 노출됨');
   assert.ok(html.includes('\\u003c/script'), '위험 문자가 \\u003c로 이스케이프되지 않음');
+});
+
+// ---------- 미등록 교육생 ----------
+const roster = [
+  { id: 'U_A', name: 'Alice Kim_42Seoul' },       // 코호트, 미등록
+  { id: 'U_B', name: 'Bob Lee_42Gyeongsan' },     // 코호트, 등록됨(ID로 대조)
+  { id: 'U_DUP1', name: 'Dan Cho_42Seoul' },      // 코호트, 미등록 (중복계정 1)
+  { id: 'U_DUP2', name: 'Dan Cho_42Seoul' },      // 코호트, 미등록 (중복계정 2 → 한 사람으로)
+  { id: 'U_ALT', name: 'Eve Park_42Seoul' },      // 코호트, 미등록이지만 같은 이름이 다른 ID로 등록됨
+  { id: 'U_STAFF', name: 'Nick Ellingson' },      // 코호트 아님(운영) → 제외
+  { id: 'U_IA', name: 'Joowon Kang_seoul_IA' },   // 코호트 아님(IA) → 제외
+];
+
+check('computeUnregistered: 코호트만, ID로 등록 대조, 중복계정 합침, 부계정 플래그', () => {
+  const out = computeUnregistered({
+    rosterMembers: roster,
+    registeredIds: ['U_B'],                 // Bob은 등록
+    registeredNames: ['Eve Park_42Seoul'],  // Eve는 다른 ID로 등록된 이름
+  });
+  const names = out.map((u) => u.name);
+  assert.deepStrictEqual(names, ['Alice Kim_42Seoul', 'Dan Cho_42Seoul', 'Eve Park_42Seoul'], '미등록 목록/정렬 오류');
+  assert.ok(!names.includes('Nick Ellingson') && !names.includes('Joowon Kang_seoul_IA'), '운영/IA가 코호트에 포함됨');
+  const dan = out.find((u) => u.name === 'Dan Cho_42Seoul');
+  assert.deepStrictEqual(dan.ids.sort(), ['U_DUP1', 'U_DUP2'], '중복계정 ID가 보존되지 않음');
+  assert.strictEqual(out.find((u) => u.name === 'Eve Park_42Seoul').alt, true, '부계정 플래그 누락');
+  assert.strictEqual(dan.alt, false, '중복계정이 부계정으로 잘못 표시됨');
+});
+
+check('renderDashboard: People 탭에 미등록 목록/안내가 렌더됨', () => {
+  const base = { summary: { students: 1, events: 0, applications: 0 }, eventRows: [], studentRows: [], generatedAt: 'x' };
+  // 로스터 없음(null) → 스코프 안내
+  assert.ok(renderDashboard(base).includes('Roster unavailable'), '로스터 없음 안내 누락');
+  // 빈 배열 → 전원 등록 문구
+  assert.ok(renderDashboard({ ...base, unregistered: [] }).includes('Everyone in the cohort'), '전원 등록 문구 누락');
+  // 목록 있음 → 이름과 카운트
+  const html = renderDashboard({ ...base, unregistered: [{ name: 'Alice Kim_42Seoul', ids: ['U_A'], alt: false }] });
+  assert.ok(html.includes('Not registered — 1'), '미등록 카운트 누락');
+  assert.ok(html.includes('Alice Kim_42Seoul'), '미등록 이름 누락');
+});
+
+check('renderUnregistered: 이름이 이스케이프됨', () => {
+  const html = renderDashboard({
+    summary: { students: 1, events: 0, applications: 0 }, eventRows: [], studentRows: [], generatedAt: 'x',
+    unregistered: [{ name: '<img src=x>_42Seoul', ids: ['U_X'], alt: false }],
+  });
+  assert.ok(!html.includes('<img src=x>_42Seoul'), '미등록 이름이 raw로 노출됨');
+  assert.ok(html.includes('&lt;img src=x&gt;'), '미등록 이름 이스케이프 안 됨');
 });
 
 (async () => {

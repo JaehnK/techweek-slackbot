@@ -14,7 +14,9 @@ const {
   dedupKey, STATUS_GOING, STATUS_VALUES,
 } = require('./format');
 const { initSchema } = require('./schema');
-const { createAdminHandler, fetchDashboardData, renderDashboard } = require('./dashboard');
+const {
+  createAdminHandler, fetchDashboardData, computeUnregistered, renderDashboard,
+} = require('./dashboard');
 
 const REQUIRED_ENV = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'DATABASE_URL', 'ANTHROPIC_API_KEY'];
 const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
@@ -202,9 +204,47 @@ async function upsertAll(slackUserId, events) {
 }
 
 // ---------- 3-b. 관리자 대시보드 ----------
+// 워크스페이스 로스터. 대시보드 로드마다 users.list를 때리지 않도록 5분 캐시한다.
+let rosterCache = { at: 0, members: null };
+const ROSTER_TTL_MS = 5 * 60 * 1000;
+
+async function fetchRoster(client) {
+  if (rosterCache.members && Date.now() - rosterCache.at < ROSTER_TTL_MS) return rosterCache.members;
+  try {
+    let raw = [];
+    let cursor;
+    do {
+      const r = await client.users.list(cursor ? { limit: 200, cursor } : { limit: 200 });
+      raw = raw.concat(r.members || []);
+      cursor = r.response_metadata?.next_cursor;
+    } while (cursor);
+    // 사람만: 봇/삭제/Slackbot 제외, 표시 이름 우선
+    const members = raw
+      .filter((u) => !u.is_bot && !u.deleted && u.id !== 'USLACKBOT')
+      .map((u) => ({ id: u.id, name: u.profile?.display_name || u.profile?.real_name || u.name }));
+    rosterCache = { at: Date.now(), members };
+    return members;
+  } catch (err) {
+    // 로스터를 못 받아도 대시보드는 그려야 한다(미등록 섹션만 안내 문구로 대체)
+    console.warn('roster fetch skipped:', err.data?.error || err.message);
+    return null;
+  }
+}
+
 async function buildDashboardHtml() {
+  const data = await fetchDashboardData(pool);
+  const roster = await fetchRoster(app.client);
+  let unregistered = null;
+  if (roster) {
+    unregistered = computeUnregistered({
+      rosterMembers: roster,
+      registeredIds: data.studentRows.map((r) => r.slack_id),
+      registeredNames: data.studentRows.map((r) => r.label),
+    });
+  }
   return renderDashboard({
-    ...(await fetchDashboardData(pool)),
+    ...data,
+    unregistered,
     generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC',
   });
 }
