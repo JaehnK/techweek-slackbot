@@ -199,6 +199,11 @@ select{font:inherit;font-size:14px;padding:5px 8px;background:var(--card);color:
 .tl-bar .bar-track{height:14px}
 .tl-tags{margin-top:2px}
 .flag{color:var(--accent);font-size:12px;white-space:nowrap}
+.tag.has-members{cursor:help;text-decoration:underline dotted;text-underline-offset:2px}
+.tip{position:fixed;z-index:50;max-width:300px;background:var(--fg);color:var(--bg);
+  padding:8px 10px;border-radius:8px;font-size:13px;line-height:1.45;pointer-events:none;
+  box-shadow:0 6px 20px rgba(0,0,0,.28)}
+.tip-head{font-weight:600;font-size:12px;opacity:.8;margin-bottom:3px}
 `;
 
 // 브라우저에서 실행되는 인터랙션 코드. 임베드된 JSON을 읽어 분포·타임라인을 다시 그린다.
@@ -217,6 +222,29 @@ const CLIENT_JS = `
   }
   function hourOf(t) { return t ? parseInt(t.slice(0, 2), 10) : null; }
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  // 상태 태그에 커서를 올리면 참석자 명단을 띄우는 공용 툴팁.
+  // 이름은 외부 문자열이라 textContent로만 넣는다(속성/innerHTML 미사용).
+  var tip = document.createElement('div');
+  tip.className = 'tip';
+  tip.style.display = 'none';
+  document.body.appendChild(tip);
+  function attachTip(node, status, members) {
+    node.addEventListener('mouseenter', function () {
+      tip.textContent = '';
+      tip.appendChild(el('div', 'tip-head', status + '  ' + members.length));
+      tip.appendChild(el('div', null, members.join(', ')));
+      tip.style.display = 'block';
+    });
+    node.addEventListener('mousemove', function (e) {
+      var x = e.clientX + 14, y = e.clientY + 14;
+      if (x + tip.offsetWidth > window.innerWidth - 8) x = e.clientX - tip.offsetWidth - 14;
+      if (y + tip.offsetHeight > window.innerHeight - 8) y = e.clientY - tip.offsetHeight - 14;
+      tip.style.left = x + 'px';
+      tip.style.top = y + 'px';
+    });
+    node.addEventListener('mouseleave', function () { tip.style.display = 'none'; });
+  }
 
   // ---- 탭 전환 ----
   var tabs = [].slice.call(document.querySelectorAll('.tab'));
@@ -379,7 +407,14 @@ const CLIENT_JS = `
       row.appendChild(bar);
 
       var tags = el('div', 'tl-tags');
-      ev.statuses.forEach(function (st) { tags.appendChild(el('span', 'tag', st.status + ' ' + st.cnt)); });
+      ev.statuses.forEach(function (st) {
+        var tag = el('span', 'tag', st.status + ' ' + st.cnt);
+        if (st.members && st.members.length) {
+          tag.className = 'tag has-members';
+          attachTip(tag, st.status, st.members);
+        }
+        tags.appendChild(tag);
+      });
       row.appendChild(tags);
       tlBody.appendChild(row);
     });
