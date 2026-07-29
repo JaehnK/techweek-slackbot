@@ -11,7 +11,7 @@ const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
 const {
   fmtWhen, buildScheduleText, buildEventStatsText, buildStudentStatsText,
-  dedupKey, STATUS_GOING, STATUS_VALUES,
+  dedupKey, partitionByDateWindow, STATUS_GOING, STATUS_VALUES,
 } = require('./format');
 const { initSchema } = require('./schema');
 const {
@@ -27,6 +27,13 @@ if (missingEnv.length) {
 
 const MAX_INPUT_LENGTH = 50000; // Luma 메인 페이지 전체 복붙(여러 주 분량)까지 허용
 const CLAUDE_MODEL = 'claude-haiku-4-5';
+
+// 행사 기간. 이 봇은 한 주짜리 TechWeek 전용이라 이 창 밖 날짜는 파싱 오류로 보고 저장하지 않는다.
+// (파서가 월을 7월→1월로 틀리게 찍는 사례가 반복돼 방어한다.) 다른 행사에 재사용하려면 env로 덮어쓴다.
+const EVENT_WINDOW = {
+  from: process.env.EVENT_WINDOW_FROM || '2026-07-24',
+  to: process.env.EVENT_WINDOW_TO || '2026-07-31',
+};
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -88,6 +95,9 @@ const EVENT_LIST_SCHEMA = {
 function buildParsePrompt(text) {
   return `다음은 Luma 캘린더 메인 페이지 전체를 복사한 텍스트야. 여기 있는 모든 이벤트를 추출해줘.
 
+**이 행사(TechWeek)는 ${EVENT_WINDOW.from} ~ ${EVENT_WINDOW.to} 한 주 동안만 열려. 모든 event_date는 반드시 이 범위 안이어야 해.**
+날짜 섹션 헤더에 월이 안 보이거나 애매하면 요일과 이 범위로 역산해서 맞춰. 절대 이 범위 밖(특히 다른 월)의 날짜를 쓰지 마.
+
 주의할 점:
 1. 시간 표기 — event_date/event_time에는 **항상 행사 현지시각**을 넣어. Luma는 보는 사람의 타임존에 따라 시간을 1개 또는 2개로 표시해:
    - **시간이 2개 있으면** (예: "오전 7:30 · 7월 27일 오후 3:30 GMT-7"): 뒤쪽의 "GMT±N"이 붙은 날짜/시간이 행사 현지시각이야. **그 날짜와 시간을 사용해** (위 예시는 event_date=2026-07-27, event_time=15:30). 앞의 타임존 없는 시간은 보는 사람 로컬 시간이니 무시해.
@@ -134,7 +144,7 @@ async function parseWithClaude(text) {
 // ---------- 3. DB upsert + 예정 일정 동기화 ----------
 // 붙여넣기를 '그 시점의 예정 일정 전체'로 보고, 빠진 예정 일정은 취소된 것으로 간주해 지운다.
 // 지난 일정은 참석 기록이므로 건드리지 않는다 (Luma '예정된' 탭엔 미래만 나오기 때문).
-async function upsertAll(slackUserId, events) {
+async function upsertAll(slackUserId, events, { allowCancellation = true } = {}) {
   const studentRes = await pool.query(
     `INSERT INTO students (name) VALUES ($1)
      ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
@@ -182,6 +192,10 @@ async function upsertAll(slackUserId, events) {
 
   // 빈 파싱 결과로 기존 일정을 통째로 날리지 않도록 방어 (호출부에서도 막지만 이중 안전장치)
   if (!touchedEventIds.length) return { saved: 0, removed: 0, removedTitles: [] };
+
+  // 파싱 일부가 기간 밖으로 걸러졌다면(붙여넣기가 불완전하게 해석됨) 취소 처리를 건너뛴다.
+  // 안 그러면 잘못 해석된 항목의 '진짜 일정'을 취소로 오인해 지울 수 있다.
+  if (!allowCancellation) return { saved: touchedEventIds.length, removed: 0, removedTitles: [] };
 
   // 이번 붙여넣기에 없는 '예정' 일정 = 취소된 것으로 보고 제거.
   // 서버는 UTC, 행사는 시애틀(UTC-7)이라 경계에서 하루 밀릴 수 있어 1일 여유를 둔다.
@@ -299,15 +313,29 @@ app.message(async ({ message, say, client }) => {
       await say("No events found. Please check the text you pasted — copy the whole Luma page and try again.");
       return;
     }
-    const { saved, removed, removedTitles } = await upsertAll(message.user, parsed);
+    // 행사 기간 밖 날짜는 파싱 오류로 보고 저장하지 않는다(월을 잘못 찍는 사례 방어).
+    const { keep, skip } = partitionByDateWindow(parsed, EVENT_WINDOW.from, EVENT_WINDOW.to);
+    if (skip.length) {
+      console.warn(`skipped ${skip.length} out-of-window event(s):`,
+        skip.map((e) => `${e.event_date} ${e.title}`).join(' | '));
+    }
+    // 일부가 걸러졌으면 이번 붙여넣기는 불완전하므로 자동 취소 처리를 끈다.
+    const { saved, removed, removedTitles } = await upsertAll(message.user, keep, {
+      allowCancellation: skip.length === 0,
+    });
     await rememberDisplayName(client, message.user); // 대시보드 표기용 (실패해도 무방)
-    // 제거된 항목은 반드시 알려준다. 일부만 복사해 보냈을 때 본인이 바로 알아채야 하므로.
+
     const removedNote = removed
       ? `\n🗑 Removed ${removed} cancelled event(s):\n`
         + removedTitles.map((t) => `  · ${t}`).join('\n')
         + `\nIf that wasn't intended, please copy and send the entire Luma page again.`
       : '';
-    await say(`✅ Saved ${saved} event(s)!${removedNote}`);
+    // 걸러낸 항목은 날짜 오류일 가능성이 높으니 사용자에게 알린다.
+    const skippedNote = skip.length
+      ? `\n⚠️ Skipped ${skip.length} event(s) dated outside TechWeek (${EVENT_WINDOW.from} ~ ${EVENT_WINDOW.to}) — likely a date misread, so not saved:\n`
+        + skip.map((e) => `  · ${e.event_date} — ${e.title}`).join('\n')
+      : '';
+    await say(`✅ Saved ${saved} event(s)!${removedNote}${skippedNote}`);
   } catch (err) {
     console.error(err);
     await say('⚠️ Something went wrong while processing your message. Please try again.');

@@ -2,7 +2,7 @@
 const assert = require('assert');
 const {
   fmtWhen, weekdaySuffix, buildScheduleText, buildEventStatsText, buildStudentStatsText,
-  dedupKey, MAX_SLACK_TEXT,
+  dedupKey, partitionByDateWindow, MAX_SLACK_TEXT,
 } = require('./format');
 
 let pass = 0;
@@ -168,6 +168,21 @@ check('dedupKey: 공백/대소문자 차이를 흡수', () => {
 
 check('dedupKey: 날짜가 다르면 다른 키', () => {
   assert.notStrictEqual(dedupKey('A', '2026-07-29'), dedupKey('A', '2026-07-30'));
+});
+
+check('partitionByDateWindow: 기간 밖 날짜(파싱 오류)를 걸러내고 미정은 통과', () => {
+  const events = [
+    { title: 'In A', event_date: '2026-07-24' },   // 경계 시작 → keep
+    { title: 'In B', event_date: '2026-07-31' },   // 경계 끝 → keep
+    { title: 'Wrong month', event_date: '2026-01-20' }, // 밖 → skip
+    { title: 'After', event_date: '2026-08-01' },  // 밖 → skip
+    { title: 'TBD', event_date: null },            // 미정 → keep
+  ];
+  const { keep, skip } = partitionByDateWindow(events, '2026-07-24', '2026-07-31');
+  assert.deepStrictEqual(keep.map((e) => e.title), ['In A', 'In B', 'TBD'], 'keep 목록 오류');
+  assert.deepStrictEqual(skip.map((e) => e.title), ['Wrong month', 'After'], 'skip 목록 오류');
+  // 빈 입력/누락에도 안전
+  assert.deepStrictEqual(partitionByDateWindow(null, '2026-07-24', '2026-07-31'), { keep: [], skip: [] });
 });
 
 

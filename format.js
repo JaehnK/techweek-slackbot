@@ -135,7 +135,20 @@ function dedupKey(title, eventDate) {
   return `${normalized}|${eventDate || ''}`;
 }
 
+// 행사 기간(from~to, 'YYYY-MM-DD') 밖의 날짜를 걸러낸다. 이 봇은 한 주짜리 행사용이라
+// 기간 밖 날짜는 파싱 오류(월을 잘못 찍는 등)로 단정할 수 있다. 날짜 미정(null)은 통과시킨다.
+function partitionByDateWindow(events, from, to) {
+  const keep = [];
+  const skip = [];
+  for (const ev of events || []) {
+    const d = ev.event_date;
+    if (d && (d < from || d > to)) skip.push(ev);
+    else keep.push(ev);
+  }
+  return { keep, skip };
+}
+
 module.exports = {
   fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, buildEventStatsText,
-  buildStudentStatsText, dedupKey, MAX_SLACK_TEXT, STATUS_GOING, STATUS_VALUES,
+  buildStudentStatsText, dedupKey, partitionByDateWindow, MAX_SLACK_TEXT, STATUS_GOING, STATUS_VALUES,
 };
