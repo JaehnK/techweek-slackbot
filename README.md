@@ -1,149 +1,221 @@
 # techweek-slackbot
 
-테크위크 이벤트 신청 현황을 관리하는 Slack 봇. Slack DM으로 Luma 페이지 텍스트를 붙여넣으면 Claude(`claude-haiku-4-5`)가 이벤트 목록을 JSON으로 구조화 추출해 Postgres에 저장하고, 슬래시 커맨드로 전체/개인 신청 현황을 조회할 수 있다.
+> **상태: 운영 종료 (archived).** 2026 Seattle Tech Week(7/24–7/31) 기간 동안 42 Seoul / 42 Gyeongsan 교육생 원정단의 일정 취합용으로 운영했고, 행사 후 참여 기록까지 수집한 뒤 배포를 내렸다. 코드는 그대로 실행 가능하다.
 
-## 아키텍처
+Luma 페이지를 Slack DM에 그대로 붙여넣으면 Claude가 이벤트 목록을 구조화해 Postgres에 저장하고, 슬래시 커맨드와 웹 대시보드로 "누가·언제·어디에" 가는지 한눈에 보게 해 주는 봇.
 
-- `@slack/bolt` — Slack Events API + 슬래시 커맨드 (HTTP 모드, Express 내장 리시버)
-- `@anthropic-ai/sdk` — Claude structured outputs로 이벤트 목록 파싱
-- `pg` — Postgres. 최초 실행 시 `students` / `events` / `applications` 테이블과 트리거를 자동 생성
+- **규모**: 교육생 29명, 이벤트 89개, 신청 185건 (운영 종료 시점)
+- **스택**: Node.js 18+ · `@slack/bolt` (HTTP mode) · `@anthropic-ai/sdk` (structured outputs, `claude-haiku-4-5`) · `pg` · Railway
+- **테스트**: `npm test` — 외부 의존 없는 순수 함수 회귀 테스트 48개
 
-## 로컬 개발
+---
+
+## 왜 만들었나
+
+Tech Week 행사는 수십 개 세션이 [Luma](https://luma.com)에 흩어져 있고, 각자 자기 계정으로 신청한다. Luma에는 "우리 그룹이 어디에 신청했는지"를 모아 볼 API나 공유 기능이 없다. 운영진이 30명에게 매번 물어보는 대신, **이미 보고 있는 Luma 화면을 복사해서 DM으로 보내면 끝**나게 만드는 것이 목표였다.
+
+## 사용 흐름
+
+```
+교육생                      봇                              운영진
+──────                     ──                              ──────
+Luma '예정된' 탭 전체 복사
+  └─ DM에 붙여넣기 ──────▶ Claude 파싱 (JSON schema)
+                            ├─ 행사 기간 밖 날짜 걸러냄
+                            ├─ 이벤트 upsert (title+date 키)
+                            ├─ 신청 upsert (Going 역행 방지)
+                            └─ 빠진 예정 일정 = 취소로 동기화
+                          ◀─ "✅ Saved 7 event(s)! 🗑 Removed 1 cancelled"
+                                                             /schedule · /event-stats · /students
+                                                             GET /admin (토큰 보호 대시보드)
+행사 후: Luma '지난' 탭 복사
+  └─ DM에 붙여넣기 ──────▶ 모든 날짜가 과거 → attendances에 기록
+                            (사전 신청 테이블은 건드리지 않음)
+```
+
+### Slack 커맨드
+
+| 커맨드 | 설명 |
+|---|---|
+| `/schedule` | 날짜 → 시간대별 참석자 (누가 언제 비는지) |
+| `/event-stats` | 날짜별 이벤트 × 상태 집계 |
+| `/students` | 사람별 신청 합계 + 상태 분해 (신청 0건인 사람도 표시) |
+| `/events` | 전체 신청 평면 목록 |
+| `/my-events` | 내 신청 내역 + 참여 기록 |
+| DM `delete` | 내 기록 하나를 고르는 Block Kit 셀렉트 → 삭제 (본인 것만) |
+
+### 관리자 대시보드 (`GET /admin?key=…`)
+
+Slack 밖에서 보는 읽기 전용 HTML 한 장. 서버가 렌더한 HTML + 인라인 JS로 동작하고 프레임워크·빌드 단계가 없다.
+
+| 탭 | 내용 |
+|---|---|
+| By time slot | 시간대별 참석 인원 분포 (날짜/상태 필터, 브라우저에서 즉시 재계산) |
+| Timeline | 하루 일정을 시간순으로, 동시간대 겹침과 **한 사람이 두 곳에 신청한 충돌** 표시 |
+| Schedule | 날짜별 이벤트 × 상태 × 참석자 |
+| Attendance | 행사 후 수집한 실제 참여 기록 |
+| Pre-registration | 행사 종료 시점의 사전 신청 동결 스냅샷 |
+| People | 사람별 요약(펼치면 일별 스케줄) + 워크스페이스 로스터 대조로 **미등록 교육생** 목록 |
+
+---
+
+## 구조
+
+```
+index.js       진입점. Slack App, Claude 파싱, DB 쓰기, 커맨드 라우팅
+format.js      슬래시 커맨드 출력·판정 로직 (순수 함수)
+schema.js      DDL + idempotent 마이그레이션 (기동 시마다 실행)
+dashboard.js   /admin 인증·집계·HTML 렌더 (pool/토큰을 주입받아 단독 테스트 가능)
+test-format.js 회귀 테스트 (npm test)
+test-parse.js  실제 Luma 샘플로 Claude 파싱 검증 (실 API 호출, npm run test:parse)
+scripts/       운영 중 데이터 복구에 쓴 일회성 스크립트 (아래 '운영 기록' 참고)
+```
+
+### 데이터 모델
+
+```
+students          Slack user ID(name)를 키로. display_name은 users.info로 별도 보관
+events            dedup_key = lower(title 공백정규화) | event_date  ← 유일성 담당
+applications      (student, event) UNIQUE, status ∈ {Going, Pending approval, Waitlist, Invited, Unknown}
+attendances       (student, event) UNIQUE. 행사 후 '지난' 탭 복붙으로만 쌓임
+pre_registrations FK 없는 값 복사본. applications를 한 번 스냅샷 뜬 동결 테이블
+```
+
+`students.application_count / pending_count`는 트리거로 유지하고, 트리거 함수가 바뀌어도 기존 행이 어긋나지 않게 기동 시 재계산한다.
+
+---
+
+## 설계 결정과 겪은 문제
+
+포트폴리오 관점에서 이 프로젝트의 핵심은 "LLM 파싱 결과를 믿고 DB에 쓰는" 구조에서 **데이터가 어떻게 깨지는지, 그걸 어떻게 막았는지**다.
+
+### 1. 날짜/시간은 항상 행사 현지시각으로 저장
+
+Luma는 보는 사람의 타임존에 따라 시간을 1개 또는 2개(`오전 7:30 · 7월 27일 오후 3:30 GMT-7`)로 보여준다. 한국에서 보면 날짜 섹션 헤더(`7월 28일 화요일`)가 시애틀 현지 날짜와 하루 어긋난다.
+
+- 시간이 2개면 `GMT±N`이 붙은 쪽의 **날짜와 시간**을 쓴다 (섹션 헤더 무시).
+- 시간이 1개면 보는 사람 = 행사 타임존이므로 그대로 쓰고 날짜는 헤더를 쓴다.
+
+이 규칙이 없으면 한국에서 붙여넣은 사람과 시애틀에서 붙여넣은 사람이 **같은 이벤트를 다른 날짜로 저장**해 중복 행이 생긴다. 프롬프트에 규칙을 명시하고 `test-parse.js`로 회귀를 잡는다.
+
+### 2. 이벤트 유일 키: `luma_url` → `title + date`
+
+처음엔 `luma_url`을 UNIQUE 키로 썼다. 그런데 복사한 텍스트에 URL이 있을 때도, 없을 때도 있어서 같은 이벤트가 URL 유무에 따라 두 행으로 갈라졌다. 여러 명이 같은 이벤트를 올리면 반드시 재발하는 구조였다.
+
+`dedup_key`(제목 공백·대소문자 정규화 + 날짜)로 옮기고, [schema.js](schema.js)의 `migrateDedupKey()`가 기존 중복 행을 대표 행으로 병합하면서 신청/참여 기록의 FK를 옮기고 URL은 살린다. 전 과정이 idempotent라 매 기동마다 돌려도 안전하다.
+
+### 3. 상태값 정규화
+
+Luma 표시 언어에 따라 `참석`/`Going`이 섞여 들어오면 `status = 'Going'` 비교가 조용히 깨진다. Claude 출력 스키마에서 `status`를 영어 enum으로 고정하고, 이미 저장된 한국어 값은 마이그레이션으로 옮겼다.
+
+### 4. 재붙여넣기 = 예정 일정 동기화
+
+Luma에서 신청을 취소하면 다시 붙여넣은 텍스트에 그 이벤트가 안 나온다. 그래서 붙여넣기를 "그 시점의 예정 일정 전체"로 보고, 빠진 예정 일정은 취소로 간주해 제거한다. 단, 잘못 지우는 것이 더 위험하므로 안전장치를 겹겹이 뒀다.
+
+- 지난 일정(참석 기록)은 삭제 대상에서 제외 — Luma '예정된' 탭엔 미래만 나오기 때문. 서버 UTC ↔ 시애틀 UTC-7 경계를 감안해 `CURRENT_DATE - 1일` 기준.
+- 파싱 결과가 비면 삭제를 건너뛴다 (기존 일정 전멸 방지).
+- 일부 이벤트가 기간 밖으로 걸러졌다면 붙여넣기가 불완전하게 해석된 것이므로 삭제를 끈다.
+- 단일 이벤트(상세 페이지 복붙)는 "전체 목록"이 아니므로 삭제를 끈다.
+- 삭제된 항목은 DM 응답에 나열해 본인이 즉시 알아채게 한다.
+
+### 5. `Going` 역행 방지
+
+승인이 나서 `Going`이 된 뒤 오래된 텍스트를 다시 붙여넣으면 `Pending approval`로 되돌아간다. `ON CONFLICT … DO UPDATE`의 `CASE`로 `Going → 다른 상태` 전이만 막는다 (그 외 전이는 최신값으로 덮어씀).
+
+### 6. LLM 파싱 오류 방어: 행사 기간 창
+
+운영 중 파서가 **7월을 1월로** 찍는 사례가 반복됐다 (한 배치 안에서 월만 틀리고 날짜 간격은 보존되는 패턴). 봇은 한 주짜리 행사 전용이므로 `EVENT_WINDOW`(env로 덮어쓰기 가능) 밖 날짜는 파싱 오류로 단정하고 저장하지 않으며, 사용자에게 어떤 항목이 걸러졌는지 알린다. 프롬프트에도 기간을 명시해 1차로 막는다.
+
+이 방어가 들어가기 전에 이미 오염된 데이터는 [`scripts/`](scripts/)의 복구 스크립트로 정리했다 (아래 '운영 기록').
+
+### 7. 사전 신청과 실제 참여의 분리
+
+행사가 끝나면 Luma '예정된' 탭은 비고 '지난' 탭에만 나온다. 모든 날짜가 오늘 이전인 붙여넣기는 '지난' 탭으로 판별(`isPastPaste`)해 별도 테이블 `attendances`에 기록한다. 이 경로는 취소 동기화를 하지 않는다 — 참여 사실은 나중에 사라질 수 없고, 지난 탭 복붙이 전체 목록이 아닐 수도 있어서다.
+
+동시에, 계속 upsert되는 `applications`에는 "행사 종료 시점의 결과"가 남지 않으므로, 참여 수집을 시작하면서 한 번 `pre_registrations`로 값을 복사해 동결했다. FK 없이 값으로 복사해 이후 병합/삭제의 영향을 받지 않는다.
+
+### 8. 대시보드 보안
+
+공개 도메인에 교육생 이름·일정이 노출되는 페이지라 기본값은 "꺼짐"이다.
+
+- `ADMIN_TOKEN` 미설정 시 `/admin`은 404 (존재 자체를 숨김). 틀리면 401.
+- 토큰 비교는 SHA-256 해시 후 `timingSafeEqual` — 길이가 달라도 예외가 없고 타이밍 정보가 새지 않는다.
+- 토큰이 URL에 실리므로 `cache-control: no-store`, `referrer-policy: no-referrer`, `x-robots-tag: noindex`.
+- 이벤트 제목·장소·이름은 외부 입력이라 전부 HTML 이스케이프. 링크는 `http(s)`만 통과(`javascript:` 차단). `<script type="application/json">`에 넣는 페이로드는 `<`를 이스케이프해 조기 종료 주입을 막는다.
+
+### 9. 테스트 가능한 구조
+
+Bolt `App`을 생성하는 순간 `auth.test`가 호출되어 유효한 Slack 토큰이 필요해진다. 그래서 포맷/판정/렌더 로직을 `index.js` 밖의 순수 함수로 빼고 (`format.js`, `dashboard.js`), DB 풀과 토큰은 인자로 주입한다. `npm test`는 네트워크·DB 없이 1초 안에 끝난다.
+
+---
+
+## 운영 기록: 데이터 복구
+
+LLM 파싱 오류로 생긴 이상치를 두 차례 정리했다. 두 스크립트 모두 `--apply` 없이 실행하면 트랜잭션 안에서 변경 내용만 출력하고 롤백하는 dry-run 방식이다.
+
+- [`scripts/recover-dates.js`](scripts/recover-dates.js) (7/29) — 기간 밖 이상치 18건(정상 행과 제목·시간이 일치하는 중복 15건 + 날짜만 틀린 3건), 기간 안에서 하루 어긋난 중복 5건, 이벤트 간 URL이 한 칸 밀린 오염, 시간 오차 2건. 정답은 Luma 이벤트 페이지 JSON-LD·공식 캘린더 API·주최측 페이지로 하나씩 대조해 확정했다. 요가처럼 실제로 2세션인 이벤트는 병합 대상에서 제외.
+- [`scripts/fix-dates-20260730.js`](scripts/fix-dates-20260730.js) (7/30) — 한 배치에서 `2026-01-xx`로 파싱된 9건을 7월 원본으로 병합. 이 사건이 계기가 되어 6번의 기간 창 방어가 들어갔다.
+
+DB 덤프(`backup-*.json`)는 실명·Slack ID가 들어 있어 `.gitignore`로 막아 두었다.
+
+---
+
+## 로컬 실행
 
 ```bash
 npm install
 cp .env.example .env   # 값 채우기
-npm start
+npm start              # http://localhost:3000/health → ok
 ```
 
-`/health` 엔드포인트로 헬스체크 가능 (`GET http://localhost:3000/health`).
-
-## 관리자 대시보드 (`GET /admin`)
-
-Slack 밖에서 전체 현황을 한 화면으로 보는 읽기 전용 HTML 페이지. 요약 카드(인원/이벤트/신청 수), 날짜별 스케줄(상태별 참석자 포함), 사람별 신청 요약을 보여준다.
+| 환경변수 | 필수 | 설명 |
+|---|---|---|
+| `SLACK_BOT_TOKEN` | ✓ | `xoxb-…` |
+| `SLACK_SIGNING_SECRET` | ✓ | |
+| `DATABASE_URL` | ✓ | Postgres. 스키마는 기동 시 자동 생성 |
+| `ANTHROPIC_API_KEY` | ✓ | |
+| `PORT` | | 기본 3000 |
+| `ADMIN_TOKEN` | | 설정해야 `/admin`이 켜진다. `openssl rand -hex 24` |
+| `EVENT_WINDOW_FROM` / `_TO` | | 행사 기간. 기본 `2026-07-24` ~ `2026-07-31` |
 
 ```bash
-# .env에 토큰을 넣고 (예: openssl rand -hex 24)
-ADMIN_TOKEN=<토큰>
-
-# 접근 — 쿼리스트링 또는 Bearer 헤더
-open "https://<railway-도메인>/admin?key=<토큰>"
-curl -H "Authorization: Bearer <토큰>" https://<railway-도메인>/admin
+npm test             # 포맷·판정·렌더 회귀 테스트 (외부 의존 없음)
+npm run test:parse   # 실제 Luma 샘플을 Claude에 보내 날짜/시간/상태 검증 (실 API 호출, 소량 과금)
 ```
 
-- **`ADMIN_TOKEN`이 비어 있으면 `/admin`은 404를 돌려준다.** 공개 도메인이라 기본값은 "꺼짐"이어야 한다. 배포 환경에 토큰을 설정해야 켜진다.
-- 토큰 비교는 SHA-256 해시 후 `timingSafeEqual`. 길이가 달라도 예외가 나지 않고 타이밍 정보도 새지 않는다.
-- 토큰이 URL에 실리므로 응답에 `cache-control: no-store`, `referrer-policy: no-referrer`, `x-robots-tag: noindex`를 붙인다. 그래도 URL은 브라우저 히스토리·프록시 로그에 남으니 링크 공유에 주의.
-- 이벤트 제목·장소는 Luma에서 파싱한 외부 문자열이라 전부 HTML 이스케이프한다.
-- 조회·렌더·핸들러 모두 `dashboard.js`에 있고 의존성(`pool`, 토큰, HTML 빌더)을 인자로 받는다. 덕분에 Slack 앱을 띄우지 않고 테스트할 수 있다.
+## 배포 (Railway)
 
-## Slack 앱 설정 (api.slack.com/apps)
-
-1. **Socket Mode는 사용하지 않음** — Events API(HTTP)로 동작하므로 배포 후 공개 URL이 필요하다.
-2. **OAuth & Permissions → Bot Token Scopes**: `chat:write`, `im:history`, `im:read`, `commands`, `users:read`
-   - `users:read`는 관리자 대시보드에 Slack ID 대신 표시 이름을 보여주기 위한 것. 없어도 봇은 정상 동작하고 대시보드에 ID(`U…`)로 표시된다.
-3. **Event Subscriptions**: Request URL = `https://<railway-도메인>/slack/events` (배포 후 설정). Subscribe to bot events: `message.im`
-4. **Slash Commands**: 아래 4개 각각 Request URL = `https://<railway-도메인>/slack/events`
-
-   | Command | 설명 |
-   |---|---|
-   | `/events` | 전체 신청 현황 (평면 목록) |
-   | `/schedule` | 시간대별 참석 현황 (날짜별 타임라인) |
-   | `/event-stats` | 이벤트별 신청 통계 (날짜별, 상태 분해) |
-   | `/students` | 인당 신청 현황 (사람별 합계 + 상태 분해) |
-   | `/my-events` | 내 신청 내역 |
-5. **Basic Information**에서 Signing Secret 확인 → `SLACK_SIGNING_SECRET`
-6. 앱을 워크스페이스에 설치 후 Bot User OAuth Token(`xoxb-...`) 확인 → `SLACK_BOT_TOKEN`
-
-## 배포 현황 (Railway)
-
-Railway CLI로 배포 완료.
-
-- **프로젝트**: `techweek-slackbot` (Railway)
-- **서비스**: `techweek-app`(앱) + `Postgres`(DB)
-- **공개 도메인**: https://techweek-app-production.up.railway.app
-- **환경변수**: `SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`, `ANTHROPIC_API_KEY`는 CLI로 설정됨. `DATABASE_URL`은 `${{Postgres.DATABASE_URL}}` 참조로 연결(내부 네트워크). `PORT`는 Railway가 자동 주입.
-- **빌드**: Railway가 `package.json` 감지 → `npm install` → `npm start`.
-
-앱은 정상 상주 중이다 (`/health` → 200, Slack `auth.test` 통과, 대시보드가 실데이터를 서빙).
-
-- 로컬 개발용 `DATABASE_URL`은 Railway 공개 프록시(`DATABASE_PUBLIC_URL`)를 쓴다. 값은 `railway variables --service Postgres --kv`로 확인.
-  배포 환경에서는 내부 네트워크(`postgres.railway.internal`)를 쓰므로 둘을 섞지 말 것.
-- **GitHub 자동 배포가 걸려 있지 않다.** main에 머지해도 반영되지 않으므로 `railway up --service techweek-app`으로 수동 배포해야 한다.
-
-### ⚠️ 남은 작업 — `users:read` 스코프
-
-대시보드가 참석자를 표시 이름 대신 Slack ID(`U…`)로 보여준다. 봇 토큰에 `users:read`가 없어 `users.info` 호출이 `missing_scope`로 실패하기 때문(기동 로그의 `display names backfilled: 0/17`). 봇 동작 자체에는 영향이 없다.
-
-1. api.slack.com/apps → **OAuth & Permissions → Bot Token Scopes**에 `users:read` 추가
-2. **워크스페이스에 앱 재설치** (스코프 추가만으로는 권한이 부여되지 않는다)
-3. 재설치로 `xoxb-` 토큰이 바뀌면 교체 (값이 로그에 안 남게 stdin으로):
-   ```bash
-   printf '%s' 'xoxb-새토큰' | railway variable set --service techweek-app --stdin SLACK_BOT_TOKEN
-   ```
-4. 재배포하면 기동 직후 백필이 다시 돌아 표시 이름이 채워진다. 로그에서 `display names backfilled: N/17` 확인.
-
-### 참고 — CLI로 처음부터 다시 배포하는 절차
+Socket Mode를 쓰지 않고 Events API(HTTP)로 동작하므로 공개 URL이 필요하다. Railway CLI 기준:
 
 ```bash
-railway init --name techweek-slackbot     # 프로젝트 생성 + 디렉토리 링크
-railway add --database postgres            # Postgres 추가
-railway add --service techweek-app         # 앱 서비스 생성
-# 시크릿(stdin) + DB 참조 변수 설정
+railway init --name techweek-slackbot
+railway add --database postgres
+railway add --service techweek-app
 printf '%s' "$SLACK_BOT_TOKEN"      | railway variable set -s techweek-app --skip-deploys --stdin SLACK_BOT_TOKEN
 printf '%s' "$SLACK_SIGNING_SECRET" | railway variable set -s techweek-app --skip-deploys --stdin SLACK_SIGNING_SECRET
 printf '%s' "$ANTHROPIC_API_KEY"    | railway variable set -s techweek-app --skip-deploys --stdin ANTHROPIC_API_KEY
 railway variable set -s techweek-app --skip-deploys 'DATABASE_URL=${{Postgres.DATABASE_URL}}'
-railway up --service techweek-app          # 로컬 디렉토리 업로드 → 빌드/배포
-railway domain --service techweek-app      # 공개 도메인 발급
+railway up --service techweek-app
+railway domain --service techweek-app
 ```
 
-> `.env`와 `node_modules`는 `.gitignore`에 있어 `railway up` 업로드에서 자동 제외된다 (시크릿은 Railway 환경변수로만 관리).
+Railway가 `package.json`을 감지해 `npm install` → `npm start`로 띄운다. `.env`와 `node_modules`는 `.gitignore`에 있어 업로드에서 제외된다. 로컬 개발에서 Railway DB에 붙을 땐 공개 프록시(`DATABASE_PUBLIC_URL`)를, 배포 환경에서는 내부 네트워크 주소를 써야 한다.
 
-<details>
-<summary>대안: GitHub 연동 방식 (dashboard)</summary>
+## Slack 앱 설정 (api.slack.com/apps)
 
-1. GitHub 저장소에 push (이미 완료: https://github.com/JaehnK/techweek-slackbot)
-2. [railway.app](https://railway.app) → New Project → **Deploy from GitHub repo** → 저장소 선택
-3. Postgres 플러그인 추가, 위와 동일한 환경변수 설정
-4. push할 때마다 자동 재배포
-</details>
+1. **OAuth & Permissions → Bot Token Scopes**: `chat:write`, `im:history`, `im:read`, `commands`, `users:read`
+   - `users:read`는 대시보드에 Slack ID 대신 표시 이름을 보여주고 미등록자를 대조하기 위한 것. 스코프를 추가하면 **워크스페이스에 앱을 재설치**해야 반영된다.
+2. **Event Subscriptions**: Request URL `https://<도메인>/slack/events`, bot event `message.im`
+3. **Interactivity & Shortcuts**: 켜고 Request URL 동일 (`delete` 셀렉트 메뉴용)
+4. **Slash Commands**: `/events` `/schedule` `/event-stats` `/students` `/my-events` 각각 Request URL 동일
+5. Signing Secret → `SLACK_SIGNING_SECRET`, 설치 후 Bot User OAuth Token → `SLACK_BOT_TOKEN`
 
-<details>
-<summary>(구) 수동 배포 단계 메모</summary>
+---
 
-1. GitHub에 새 저장소 생성 후 이 프로젝트 push
-   ```bash
-   git remote add origin git@github.com:<user>/techweek-slackbot.git
-   git push -u origin main
-   ```
-2. [railway.app](https://railway.app) → New Project → **Deploy from GitHub repo** → 위 저장소 선택
-3. Railway 프로젝트에 **Postgres 플러그인 추가** → `DATABASE_URL`이 자동으로 서비스 환경변수에 주입됨
-4. 서비스 Variables에 아래 값 추가:
-   - `SLACK_BOT_TOKEN`
-   - `SLACK_SIGNING_SECRET`
-   - `ANTHROPIC_API_KEY`
-   - (`DATABASE_URL`, `PORT`는 Railway가 자동 설정)
-5. Railway가 Nixpacks로 `package.json`을 감지해 `npm install` → `npm start`로 빌드/실행 (별도 설정 파일 불필요)
-6. 배포 후 발급되는 공개 도메인(`https://<app>.up.railway.app`)을 Slack 앱의 Event Subscriptions / Slash Commands Request URL에 등록
-7. `/health`로 정상 기동 확인 후 DM 테스트
+## 한계와 회고
 
-</details>
-
-## 알아둘 점
-
-- 봇은 **DM에서만** 텍스트를 파싱한다 (`channel_type === 'im'` 체크). 채널 멘션에는 반응하지 않는다.
-- Luma 캘린더 **메인 페이지 전체**를 복붙하는 것을 전제로 파싱 프롬프트가 작성되어 있다. 입력 텍스트가 50,000자를 넘으면 파싱을 거부한다 (Claude 호출 비용/토큰 보호).
-- **날짜/시간은 항상 행사 현지시각으로 저장한다.** Luma는 보는 사람 타임존에 따라 시간을 1~2개로 표시하므로 규칙이 필요하다:
-  - 시간이 **2개**면 (`오전 7:30 · 7월 27일 오후 3:30 GMT-7`) → `GMT±N`이 붙은 쪽이 현지시각. **그 옆의 날짜까지** 사용한다 (위 예시 → `2026-07-27 15:30`).
-  - 시간이 **1개**면 (GMT 표기 없음) → 보는 사람 타임존 = 행사 타임존이라는 뜻이므로 그대로 쓰고, 날짜는 섹션 헤더를 사용한다.
-  - ⚠️ 시간이 2개일 때 **날짜 섹션 헤더(`7월 28일 화요일`)를 따라가면 안 된다** — 그건 보는 사람 로컬 날짜라 행사 현지 날짜와 하루 어긋난다. 한국에서 보면 Luma 화면이 봇 출력보다 하루 뒤로 보이는 게 정상.
-  - 이 규칙 덕에 어느 타임존에서 붙여넣어도 같은 값이 나와 중복 row가 안 생긴다. 슬래시 커맨드 출력에도 `(행사 현지시각 기준)`을 명시한다.
-- 출력 포맷팅은 `format.js`(순수 함수)로 분리해 DB/Slack 없이 테스트할 수 있다. `index.js`에서 Bolt `App`을 생성하면 그 시점에 `auth.test`가 호출되므로, 포맷 로직을 `index.js`에 두면 테스트에서도 유효한 Slack 토큰이 필요해진다.
-- 테스트:
-  - `npm test` — 출력 포맷 회귀 테스트 (외부 의존 없음, 빠름)
-  - `npm run test:parse` — 실제 Luma 샘플을 Claude에 보내 날짜/시간/상태를 검증 (실제 API 호출 → `ANTHROPIC_API_KEY` 필요, 소량 과금)
-- `luma_url`이 텍스트에서 보이지 않으면(대부분의 경우) `title-event_date` 조합을 대신 유니크 키로 사용한다. 위 타임존 규칙이 깨지면 이 키도 흔들려 중복이 생기니 주의.
-- 신청 상태(`applications.status`)가 한 번 `참석`으로 확정되면, 오래된 텍스트를 다시 붙여넣어도 `승인 대기 중`으로 되돌아가지 않는다 (그 외 상태 전이는 항상 최신값으로 덮어씀).
-- **재붙여넣기 = 예정 일정 동기화.** 붙여넣기를 "그 시점의 예정 일정 전체"로 보고, 빠진 예정 일정은 취소된 것으로 간주해 그 학생의 신청에서 제거한다. Luma `예정된` 탭에는 미래 일정만 나오므로 **지난 일정(참석 기록)은 삭제 대상에서 제외**한다 (서버 UTC ↔ 시애틀 UTC-7 경계를 감안해 `CURRENT_DATE - 1일`을 기준으로 둔다). 파싱 결과가 비면 삭제를 아예 건너뛴다(기존 일정 전멸 방지). 제거된 항목은 DM 응답에 목록으로 알려 일부만 복사해 보낸 경우 본인이 즉시 알아챌 수 있게 한다.
-- `students.name` 컬럼에는 표시 이름이 아니라 **Slack user ID**가 저장된다 (조회 커맨드의 조인 키로 사용). Slack 출력은 `<@ID>`로 멘션 렌더링되지만 대시보드는 그럴 수 없어, `users.info`로 받은 표시 이름을 `students.display_name`에 따로 저장한다. DM 수신 때마다 갱신하고, 기존 학생은 `ADMIN_TOKEN`이 설정된 경우 기동 직후 백그라운드로 한 번 메운다. 조회는 항상 `COALESCE(display_name, name)`이라 실패해도 ID로 폴백된다.
+- **LLM 파싱을 그대로 믿으면 안 된다.** 스키마 강제(structured outputs)로 형식은 보장되지만 값(특히 월)은 틀렸다. 기간 창 같은 도메인 제약을 코드에서 검증하는 것이 프롬프트 개선보다 확실했다. 다시 한다면 날짜 헤더 같은 규칙적인 부분은 정규식으로 먼저 뽑고 LLM에는 매핑만 맡길 것이다.
+- **입력이 "복붙"이라 완전성을 보장할 수 없다.** 그래서 삭제(취소 동기화)에 안전장치가 네 겹이나 필요했다. 일부만 복사한 사람에게 삭제 목록을 보여주는 것이 실제로 가장 효과적인 방어였다.
+- 코호트 판별(`_42Seoul` 접미사 정규식), 행사 기간 기본값 등 **단일 행사에 맞춘 값이 코드에 박혀 있다.** 다른 행사에 재사용하려면 env/설정으로 빼야 한다.
+- 이벤트별 DB 쓰기가 루프 안에서 순차 실행된다. 30명 규모에서는 문제 없었지만 그 이상이면 배치 upsert로 바꿔야 한다.
+- 사전 신청 스냅샷은 "행사 종료 후 첫 기동"이라는 운영 타이밍에 의존하는 일회성 마이그레이션이다. 범용 기능이라면 명시적 커맨드나 날짜 트리거로 만들어야 한다.

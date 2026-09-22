@@ -500,7 +500,7 @@ const roster = [
   { id: 'U_DUP2', name: 'Dan Cho_42Seoul' },      // 코호트, 미등록 (중복계정 2 → 한 사람으로)
   { id: 'U_ALT', name: 'Eve Park_42Seoul' },      // 코호트, 미등록이지만 같은 이름이 다른 ID로 등록됨
   { id: 'U_STAFF', name: 'Nick Ellingson' },      // 코호트 아님(운영) → 제외
-  { id: 'U_IA', name: 'Joowon Kang_seoul_IA' },   // 코호트 아님(IA) → 제외
+  { id: 'U_IA', name: 'Sam Staff_seoul_IA' },     // 코호트 아님(IA) → 제외
 ];
 
 check('computeUnregistered: 코호트만, ID로 등록 대조, 중복계정 합침, 부계정 플래그', () => {
@@ -511,7 +511,7 @@ check('computeUnregistered: 코호트만, ID로 등록 대조, 중복계정 합�
   });
   const names = out.map((u) => u.name);
   assert.deepStrictEqual(names, ['Alice Kim_42Seoul', 'Dan Cho_42Seoul', 'Eve Park_42Seoul'], '미등록 목록/정렬 오류');
-  assert.ok(!names.includes('Nick Ellingson') && !names.includes('Joowon Kang_seoul_IA'), '운영/IA가 코호트에 포함됨');
+  assert.ok(!names.includes('Nick Ellingson') && !names.includes('Sam Staff_seoul_IA'), '운영/IA가 코호트에 포함됨');
   const dan = out.find((u) => u.name === 'Dan Cho_42Seoul');
   assert.deepStrictEqual(dan.ids.sort(), ['U_DUP1', 'U_DUP2'], '중복계정 ID가 보존되지 않음');
   assert.strictEqual(out.find((u) => u.name === 'Eve Park_42Seoul').alt, true, '부계정 플래그 누락');

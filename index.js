@@ -1,8 +1,9 @@
-// techweek-slackbot: 1개 파일로 동작하는 Slack 봇
-// 테크위크 이벤트 신청 현황을 Claude로 파싱해 Postgres에 저장하고, 슬래시 커맨드로 조회한다.
+// techweek-slackbot 진입점. Slack 앱 생성, Claude 파싱, DB 쓰기, 슬래시 커맨드 라우팅을 담당한다.
+// 순수 로직은 format.js(출력/판정), schema.js(DDL·마이그레이션), dashboard.js(관리자 페이지)로 분리.
 //
 // 필요한 환경변수:
-//   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, DATABASE_URL, ANTHROPIC_API_KEY, PORT(선택)
+//   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, DATABASE_URL, ANTHROPIC_API_KEY
+//   선택: PORT, ADMIN_TOKEN(대시보드 활성화), EVENT_WINDOW_FROM/TO(행사 기간)
 
 require('dotenv').config();
 

@@ -1,3 +1,5 @@
 node_modules/
 .env
 *.log
+# DB dumps contain real Slack IDs and display names — never commit
+backup-*.json
