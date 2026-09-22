@@ -31,6 +31,16 @@ async function initSchema(pool) {
       UNIQUE (student_id, event_id)
     );
 
+    -- 행사 후 Luma '지난(Past)' 탭 복붙으로 수집하는 실제 참여 기록.
+    -- applications(사전 신청)와 분리해 두 데이터가 서로 덮어쓰지 않게 한다.
+    CREATE TABLE IF NOT EXISTS attendances (
+      id SERIAL PRIMARY KEY,
+      student_id INTEGER REFERENCES students(id),
+      event_id INTEGER REFERENCES events(id),
+      created_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (student_id, event_id)
+    );
+
     -- pending_count는 '아직 참석 확정이 아닌' 신청 수. 특정 대기 상태를 하드코딩하면
     -- Luma에 새 상태가 생길 때 조용히 누락되므로 'Going'이 아닌 것을 센다.
     CREATE OR REPLACE FUNCTION update_student_counts() RETURNS TRIGGER AS $$
@@ -54,6 +64,8 @@ async function initSchema(pool) {
 
   await migrateDedupKey(pool);
   await migrateStatusesToEnglish(pool);
+  // 중복 병합·상태 정규화가 끝난 정리된 데이터를 스냅샷 뜬다 (순서 중요)
+  await snapshotPreRegistrations(pool);
 
   // 트리거 함수가 바뀌어도 기존 행은 다음 변경 때까지 옛 값이 남으므로 즉시 재계산한다.
   await pool.query(`
@@ -125,6 +137,22 @@ async function migrateDedupKey(pool) {
     USING events e JOIN ${CANON} c ON c.dedup_key = e.dedup_key
     WHERE a.event_id = e.id AND e.id <> c.keep_id
   `);
+  // 1-b/2-b) 참여 기록도 동일하게 대표 이벤트로 이동 후 잔여분 제거 (FK가 남으면 3)이 실패)
+  await pool.query(`
+    UPDATE attendances a
+    SET event_id = c.keep_id
+    FROM events e JOIN ${CANON} c ON c.dedup_key = e.dedup_key
+    WHERE a.event_id = e.id AND e.id <> c.keep_id
+      AND NOT EXISTS (
+        SELECT 1 FROM attendances x
+        WHERE x.student_id = a.student_id AND x.event_id = c.keep_id
+      )
+  `);
+  await pool.query(`
+    DELETE FROM attendances a
+    USING events e JOIN ${CANON} c ON c.dedup_key = e.dedup_key
+    WHERE a.event_id = e.id AND e.id <> c.keep_id
+  `);
   // 3) 중복 이벤트 행 제거
   await pool.query(`
     DELETE FROM events e
@@ -153,4 +181,38 @@ async function migrateStatusesToEnglish(pool) {
   `);
 }
 
-module.exports = { initSchema, migrateDedupKey, migrateStatusesToEnglish };
+// 행사 종료 후 참여 기록(attendances) 수집이 시작되면서, 그때까지 모인 사전 신청 결과를
+// 별개 테이블에 보존한다. applications는 봇이 계속 upsert하는 라이브 테이블이라
+// '그 시점의 결과'가 남지 않기 때문. FK 없이 값으로 복사해 이후 이벤트 병합/수정/삭제의
+// 영향을 받지 않는 완전한 스냅샷으로 만든다.
+// 테이블이 비어 있을 때 한 번만 채우므로 매 기동마다 실행해도 안전하다.
+async function snapshotPreRegistrations(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pre_registrations (
+      id SERIAL PRIMARY KEY,
+      student_name TEXT,
+      student_display TEXT,
+      event_title TEXT,
+      event_date DATE,
+      event_time TIME,
+      luma_url TEXT,
+      status TEXT,
+      applied_at TIMESTAMPTZ,
+      snapshotted_at TIMESTAMPTZ DEFAULT now()
+    )
+  `);
+  const { rows } = await pool.query(`SELECT COUNT(*)::int AS n FROM pre_registrations`);
+  if (rows[0].n > 0) return 0;
+  const ins = await pool.query(`
+    INSERT INTO pre_registrations
+      (student_name, student_display, event_title, event_date, event_time, luma_url, status, applied_at)
+    SELECT s.name, s.display_name, e.title, e.event_date, e.event_time, e.luma_url, a.status, a.created_at
+    FROM applications a
+    JOIN students s ON s.id = a.student_id
+    JOIN events   e ON e.id = a.event_id
+  `);
+  if (ins.rowCount) console.log(`pre-registration snapshot saved: ${ins.rowCount} rows`);
+  return ins.rowCount;
+}
+
+module.exports = { initSchema, migrateDedupKey, migrateStatusesToEnglish, snapshotPreRegistrations };

@@ -42,13 +42,16 @@ function createAdminHandler({ token, buildHtml }) {
   };
 }
 
-// 대시보드가 쓰는 세 갈래 집계. 서로 독립이라 병렬로 던진다.
+// 대시보드가 쓰는 집계들. 서로 독립이라 병렬로 던진다.
 async function fetchDashboardData(pool) {
-  const [summary, events, students, studentEvents] = await Promise.all([
+  const [summary, events, students, studentEvents, attendance, preReg] = await Promise.all([
     pool.query(`
       SELECT (SELECT COUNT(*) FROM students)::int     AS students,
              (SELECT COUNT(*) FROM events)::int       AS events,
-             (SELECT COUNT(*) FROM applications)::int AS applications
+             (SELECT COUNT(*) FROM applications)::int AS applications,
+             (SELECT COUNT(*) FROM attendances)::int  AS attendances,
+             (SELECT TO_CHAR(MIN(snapshotted_at), 'YYYY-MM-DD HH24:MI')
+              FROM pre_registrations)                 AS snapshotted_at
     `),
     pool.query(`
       SELECT e.id AS event_id, e.title, e.location, e.luma_url,
@@ -79,14 +82,53 @@ async function fetchDashboardData(pool) {
       ORDER BY total DESC, label, a.status
     `),
     // 사람별 신청 내역(이벤트 단위). People 탭에서 사람을 펼치면 일별로 보여준다.
+    // 행사 후 수집한 참여 기록(attendances)은 'Attended' 상태로 합쳐 같은 스케줄에 보여준다.
     pool.query(`
-      SELECT a.student_id,
+      SELECT * FROM (
+        SELECT a.student_id,
+               TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+               TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
+               e.title, e.location, e.luma_url, a.status
+        FROM applications a
+        JOIN events e ON e.id = a.event_id
+        UNION ALL
+        SELECT t.student_id,
+               TO_CHAR(e.event_date, 'YYYY-MM-DD'),
+               TO_CHAR(e.event_time, 'HH24:MI'),
+               e.title, e.location, e.luma_url, 'Attended'
+        FROM attendances t
+        JOIN events e ON e.id = t.event_id
+      ) x
+      ORDER BY x.student_id, x.event_date NULLS LAST, x.event_time NULLS LAST, x.title
+    `),
+    // 참여 기록(행사 후 지난 탭 복붙)을 이벤트 단위로 집계. Attendance 탭 전용.
+    pool.query(`
+      SELECT e.id AS event_id, e.title, e.location, e.luma_url,
              TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
              TO_CHAR(e.event_time, 'HH24:MI')    AS event_time,
-             e.title, e.location, e.luma_url, a.status
-      FROM applications a
-      JOIN events e ON e.id = a.event_id
-      ORDER BY a.student_id, e.event_date NULLS LAST, e.event_time NULLS LAST, e.title
+             'Attended' AS status,
+             COUNT(*)::int AS cnt,
+             ARRAY_AGG(COALESCE(s.display_name, s.name)
+                       ORDER BY COALESCE(s.display_name, s.name)) AS members
+      FROM attendances t
+      JOIN events e   ON e.id = t.event_id
+      JOIN students s ON s.id = t.student_id
+      GROUP BY e.id, e.title, e.location, e.luma_url, e.event_date, e.event_time
+      ORDER BY e.event_date NULLS LAST, e.event_time NULLS LAST, e.title
+    `),
+    // 사전 신청 스냅샷(동결본). 값 복사 테이블이라 event_id가 없으므로 제목+날짜로 묶는다.
+    pool.query(`
+      SELECT p.event_title || '|' || COALESCE(p.event_date::text, '') AS event_id,
+             p.event_title AS title, NULL AS location, p.luma_url,
+             TO_CHAR(p.event_date, 'YYYY-MM-DD') AS event_date,
+             TO_CHAR(p.event_time, 'HH24:MI')    AS event_time,
+             p.status,
+             COUNT(*)::int AS cnt,
+             ARRAY_AGG(COALESCE(p.student_display, p.student_name)
+                       ORDER BY COALESCE(p.student_display, p.student_name)) AS members
+      FROM pre_registrations p
+      GROUP BY p.event_title, p.event_date, p.event_time, p.luma_url, p.status
+      ORDER BY p.event_date NULLS LAST, p.event_time NULLS LAST, p.event_title, p.status
     `),
   ]);
 
@@ -95,6 +137,8 @@ async function fetchDashboardData(pool) {
     eventRows: events.rows,
     studentRows: students.rows,
     studentEventRows: studentEvents.rows,
+    attendanceRows: attendance.rows,
+    preRegRows: preReg.rows,
   };
 }
 
@@ -175,6 +219,7 @@ function safeUrl(u) {
 // 상태값을 색상 클래스 슬러그로. 정규화 값이 바뀌어도 접두어 매칭이라 잘 견딘다.
 function statusSlug(status) {
   const s = String(status || '').toLowerCase();
+  if (s.startsWith('attended')) return 'attended';
   if (s.startsWith('going')) return 'going';
   if (s.startsWith('pending')) return 'pending';
   if (s.startsWith('wait')) return 'waitlist';
@@ -225,10 +270,10 @@ code{background:var(--card);border:1px solid var(--line);border-radius:6px;paddi
   background:color-mix(in srgb,var(--tc) 12%,transparent);
   border:1px solid color-mix(in srgb,var(--tc) 34%,transparent)}
 .st-going{--tc:#137333}.st-pending{--tc:#a15c00}.st-waitlist{--tc:#4f46e5}
-.st-invited{--tc:#0e7490}.st-unknown{--tc:#6b7280}
+.st-invited{--tc:#0e7490}.st-unknown{--tc:#6b7280}.st-attended{--tc:#be185d}
 @media (prefers-color-scheme:dark){
   .st-going{--tc:#4ade80}.st-pending{--tc:#fbbf24}.st-waitlist{--tc:#a5b4fc}
-  .st-invited{--tc:#67e8f9}.st-unknown{--tc:#9aa0a6}}
+  .st-invited{--tc:#67e8f9}.st-unknown{--tc:#9aa0a6}.st-attended{--tc:#f9a8d4}}
 .who{color:var(--muted);font-size:13px;line-height:1.5}
 .acc{border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .acc-item{border-bottom:1px solid var(--line)}
@@ -523,7 +568,8 @@ const CLIENT_JS = `
 `;
 
 // 이벤트 행(이벤트×상태)을 날짜별로 묶어 타임라인 테이블로 만든다.
-function renderEventsByDate(eventRows) {
+// Schedule(라이브 신청)·Attendance·Pre-reg 탭이 같은 행 모양(event_id/title/…/status/cnt/members)으로 공유한다.
+function renderEventsByDate(eventRows, emptyText = 'No events yet.') {
   const byDate = new Map();
   for (const r of eventRows) {
     const dateKey = r.event_date || 'Date TBD';
@@ -538,7 +584,7 @@ function renderEventsByDate(eventRows) {
     events.get(r.event_id).statuses.push({ status: r.status, cnt: r.cnt, members: r.members });
   }
 
-  if (!byDate.size) return '<p class="empty">No events yet.</p>';
+  if (!byDate.size) return `<p class="empty">${escapeHtml(emptyText)}</p>`;
 
   let html = '';
   for (const [date, events] of byDate) {
@@ -614,8 +660,12 @@ function renderStudents(studentRows, studentEventRows = []) {
 
   let html = '<div class="acc">';
   for (const [id, st] of byStudent) {
-    const tags = st.statuses.length
-      ? st.statuses.map((s) => `<span class="tag st-${statusSlug(s.status)}">${escapeHtml(s.status)} ${s.cnt}</span>`).join('')
+    // 참여 기록은 별개 테이블이라 studentRows(신청 집계)에 없다. 스케줄 행에서 세어 칩을 붙인다.
+    const attendedCnt = (eventsByStudent.get(id) || []).filter((e) => e.status === 'Attended').length;
+    const attendedTag = attendedCnt
+      ? `<span class="tag st-attended">Attended ${attendedCnt}</span>` : '';
+    const tags = (st.statuses.length || attendedCnt)
+      ? attendedTag + st.statuses.map((s) => `<span class="tag st-${statusSlug(s.status)}">${escapeHtml(s.status)} ${s.cnt}</span>`).join('')
       : '<span class="who">no registrations</span>';
     // 표시 이름을 못 받아온 경우 label이 곧 Slack ID이므로 중복 표기하지 않는다
     const sub = st.label === st.slackId ? '' : `<span class="who">${escapeHtml(st.slackId)}</span>`;
@@ -668,7 +718,8 @@ function renderUnregistered(unregistered) {
 }
 
 function renderDashboard({
-  summary, eventRows, studentRows, studentEventRows, unregistered, generatedAt,
+  summary, eventRows, studentRows, studentEventRows, attendanceRows = [], preRegRows = [],
+  unregistered, generatedAt,
 }) {
   const payload = buildTimeSlotPayload(eventRows);
   return `<!doctype html>
@@ -686,12 +737,15 @@ function renderDashboard({
   <div class="card"><div class="n">${summary.students}</div><div class="l">People</div></div>
   <div class="card"><div class="n">${summary.events}</div><div class="l">Events</div></div>
   <div class="card"><div class="n">${summary.applications}</div><div class="l">Registrations</div></div>
+  <div class="card"><div class="n">${summary.attendances ?? 0}</div><div class="l">Attended</div></div>
 </div>
 
 <div class="tabs" role="tablist">
   <button class="tab" data-tab="overview">By time slot</button>
   <button class="tab" data-tab="timeline">Timeline</button>
   <button class="tab" data-tab="schedule">Schedule</button>
+  <button class="tab" data-tab="attendance">Attendance</button>
+  <button class="tab" data-tab="prereg">Pre-registration</button>
   <button class="tab" data-tab="people">People</button>
 </div>
 
@@ -714,6 +768,16 @@ function renderDashboard({
 
 <section class="tab-panel" data-panel="schedule">
 ${renderEventsByDate(eventRows)}
+</section>
+
+<section class="tab-panel" data-panel="attendance">
+  <p class="hint">Actual attendance, collected after the event from each person's Luma "Past" tab. Stored separately from registrations.</p>
+${renderEventsByDate(attendanceRows, 'No attendance records yet — ask people to DM the bot their Luma "Past" tab.')}
+</section>
+
+<section class="tab-panel" data-panel="prereg">
+  <p class="hint">Frozen snapshot of pre-registrations as collected during the event${summary.snapshotted_at ? ` (taken ${escapeHtml(summary.snapshotted_at)} UTC)` : ''}. Later edits never touch this data.</p>
+${renderEventsByDate(preRegRows, 'No pre-registration snapshot yet.')}
 </section>
 
 <section class="tab-panel" data-panel="people">

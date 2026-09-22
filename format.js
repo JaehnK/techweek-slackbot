@@ -148,7 +148,53 @@ function partitionByDateWindow(events, from, to) {
   return { keep, skip };
 }
 
+// 모든 이벤트 날짜가 기준일(today, 'YYYY-MM-DD') 이전이면 Luma '지난(Past)' 탭 복붙으로 본다.
+// 예정 탭엔 오늘 이후만, 지난 탭엔 과거만 나오므로 날짜만으로 판별 가능하다.
+// 날짜 미정(null)이 하나라도 섞이면 판단할 수 없으니 예정 탭으로 취급한다(보수적).
+function isPastPaste(events, today) {
+  return (events || []).length > 0 && events.every((e) => e.event_date && e.event_date < today);
+}
+
+// DM 'delete' 키워드에 응답하는 삭제 피커(Block Kit). 본인 기록만 넘겨받아 select 메뉴로 만든다.
+// Slack 제약: plain_text 옵션 라벨 75자, select 전체 옵션 100개 — 둘 다 여기서 지킨다.
+const OPT_TEXT_MAX = 75;
+const OPT_GROUP_MAX = 50; // 두 그룹 합쳐 100개를 넘지 않도록 그룹당 상한
+function truncateLabel(s, max = OPT_TEXT_MAX) {
+  s = String(s || '');
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+function buildDeletePickerBlocks(attendedRows, registeredRows) {
+  const opt = (value, label) => ({
+    text: { type: 'plain_text', text: truncateLabel(label) }, value,
+  });
+  const groups = [];
+  if ((attendedRows || []).length) {
+    groups.push({
+      label: { type: 'plain_text', text: '🎟 Attended' },
+      options: attendedRows.slice(0, OPT_GROUP_MAX).map((r) => opt(`att:${r.id}`, `${fmtWhen(r)} | ${r.title}`)),
+    });
+  }
+  if ((registeredRows || []).length) {
+    groups.push({
+      label: { type: 'plain_text', text: '📝 Registered' },
+      options: registeredRows.slice(0, OPT_GROUP_MAX).map((r) => opt(`app:${r.id}`, `${fmtWhen(r)} | ${r.title} (${r.status})`)),
+    });
+  }
+  if (!groups.length) return null;
+  return [{
+    type: 'section',
+    text: { type: 'mrkdwn', text: 'Pick an event to delete (attendance records and registrations only — the frozen pre-registration snapshot is never touched):' },
+    accessory: {
+      type: 'static_select',
+      action_id: 'delete_event_pick',
+      placeholder: { type: 'plain_text', text: 'Select an event' },
+      option_groups: groups,
+    },
+  }];
+}
+
 module.exports = {
   fmtWhen, weekdaySuffix, joinWithinLimit, buildScheduleText, buildEventStatsText,
-  buildStudentStatsText, dedupKey, partitionByDateWindow, MAX_SLACK_TEXT, STATUS_GOING, STATUS_VALUES,
+  buildStudentStatsText, dedupKey, partitionByDateWindow, isPastPaste, buildDeletePickerBlocks,
+  MAX_SLACK_TEXT, STATUS_GOING, STATUS_VALUES,
 };

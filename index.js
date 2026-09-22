@@ -11,7 +11,8 @@ const { Pool } = require('pg');
 const Anthropic = require('@anthropic-ai/sdk');
 const {
   fmtWhen, buildScheduleText, buildEventStatsText, buildStudentStatsText,
-  dedupKey, partitionByDateWindow, STATUS_GOING, STATUS_VALUES,
+  dedupKey, partitionByDateWindow, isPastPaste, buildDeletePickerBlocks,
+  STATUS_GOING, STATUS_VALUES,
 } = require('./format');
 const { initSchema } = require('./schema');
 const {
@@ -93,7 +94,7 @@ const EVENT_LIST_SCHEMA = {
 };
 
 function buildParsePrompt(text) {
-  return `다음은 Luma 캘린더 메인 페이지 전체를 복사한 텍스트야. 여기 있는 모든 이벤트를 추출해줘.
+  return `다음은 Luma 캘린더 메인 페이지 전체(여러 이벤트) 또는 개별 이벤트 상세 페이지(한 개)를 복사한 텍스트야. 여기 있는 모든 이벤트를 추출해줘.
 
 **이 행사(TechWeek)는 ${EVENT_WINDOW.from} ~ ${EVENT_WINDOW.to} 한 주 동안만 열려. 모든 event_date는 반드시 이 범위 안이어야 해.**
 날짜 섹션 헤더에 월이 안 보이거나 애매하면 요일과 이 범위로 역산해서 맞춰. 절대 이 범위 밖(특히 다른 월)의 날짜를 쓰지 마.
@@ -106,7 +107,7 @@ function buildParsePrompt(text) {
 2. "이벤트 만들기", "탐색", "가격", "도움말" 같은 네비게이션 문구, "...의 커버 이미지" 같은 이미지 설명, "+39" 같은 참석자 수 표시는 이벤트 정보가 아니니 무시해.
 3. 호스트가 여러 명이면("&", "외 N 명" 등) 있는 그대로 host 필드에 담아.
 4. status는 원문 언어와 무관하게 아래 영어 값 중 하나로 정규화해서 넣어:
-   - 참석 / Going / Attending / Registered / Confirmed → "Going"
+   - 참석 / 참석함 / 참석 확정 / Going / Attending / Attended / Registered / Confirmed / You're In → "Going"
    - 승인 대기 중 / Pending Approval / Awaiting Approval → "Pending approval"
    - 대기자 명단 / Waitlist / Waiting List → "Waitlist"
    - 초대됨 / Invited → "Invited"
@@ -142,35 +143,45 @@ async function parseWithClaude(text) {
 }
 
 // ---------- 3. DB upsert + 예정 일정 동기화 ----------
-// 붙여넣기를 '그 시점의 예정 일정 전체'로 보고, 빠진 예정 일정은 취소된 것으로 간주해 지운다.
-// 지난 일정은 참석 기록이므로 건드리지 않는다 (Luma '예정된' 탭엔 미래만 나오기 때문).
-async function upsertAll(slackUserId, events, { allowCancellation = true } = {}) {
-  const studentRes = await pool.query(
+// Slack ID로 학생 행을 확보한다 (사전 신청/참여 기록 공용).
+async function upsertStudent(slackUserId) {
+  const res = await pool.query(
     `INSERT INTO students (name) VALUES ($1)
      ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
     [slackUserId]
   );
-  const studentId = studentRes.rows[0].id;
+  return res.rows[0].id;
+}
+
+// 이벤트 마스터 upsert (사전 신청/참여 기록 공용).
+// 중복 키는 항상 제목+날짜에서 만든다. luma_url은 붙여넣기마다 있을 수도, 없을 수도 있어
+// 키로 쓰면 같은 이벤트가 여러 행으로 갈라진다.
+async function upsertEventRow(ev) {
+  const key = dedupKey(ev.title, ev.event_date);
+  const res = await pool.query(
+    `INSERT INTO events (title, host, location, event_date, event_time, luma_url, dedup_key)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     ON CONFLICT (dedup_key) DO UPDATE SET
+       title = EXCLUDED.title, host = EXCLUDED.host,
+       location = EXCLUDED.location, event_date = EXCLUDED.event_date,
+       event_time = EXCLUDED.event_time,
+       -- URL은 한 번이라도 확보되면 유지 (URL 없는 붙여넣기가 덮어쓰지 않게)
+       luma_url = COALESCE(EXCLUDED.luma_url, events.luma_url)
+     RETURNING id`,
+    [ev.title, ev.host || null, ev.location || null, ev.event_date || null, ev.event_time || null,
+     ev.luma_url || null, key]
+  );
+  return res.rows[0].id;
+}
+
+// 붙여넣기를 '그 시점의 예정 일정 전체'로 보고, 빠진 예정 일정은 취소된 것으로 간주해 지운다.
+// 지난 일정은 참석 기록이므로 건드리지 않는다 (Luma '예정된' 탭엔 미래만 나오기 때문).
+async function upsertAll(slackUserId, events, { allowCancellation = true } = {}) {
+  const studentId = await upsertStudent(slackUserId);
   const touchedEventIds = [];
 
   for (const ev of events) {
-    // 중복 키는 항상 제목+날짜에서 만든다. luma_url은 붙여넣기마다 있을 수도, 없을 수도 있어
-    // 키로 쓰면 같은 이벤트가 여러 행으로 갈라진다.
-    const key = dedupKey(ev.title, ev.event_date);
-    const eventRes = await pool.query(
-      `INSERT INTO events (title, host, location, event_date, event_time, luma_url, dedup_key)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (dedup_key) DO UPDATE SET
-         title = EXCLUDED.title, host = EXCLUDED.host,
-         location = EXCLUDED.location, event_date = EXCLUDED.event_date,
-         event_time = EXCLUDED.event_time,
-         -- URL은 한 번이라도 확보되면 유지 (URL 없는 붙여넣기가 덮어쓰지 않게)
-         luma_url = COALESCE(EXCLUDED.luma_url, events.luma_url)
-       RETURNING id`,
-      [ev.title, ev.host || null, ev.location || null, ev.event_date || null, ev.event_time || null,
-       ev.luma_url || null, key]
-    );
-    const eventId = eventRes.rows[0].id;
+    const eventId = await upsertEventRow(ev);
     touchedEventIds.push(eventId);
 
     // 'Going'으로 확정된 신청을, 오래된 붙여넣기로 인해 대기 상태로 되돌리지 않도록 방지
@@ -215,6 +226,24 @@ async function upsertAll(slackUserId, events, { allowCancellation = true } = {})
     removed: del.rowCount,
     removedTitles: del.rows.map((r) => r.title),
   };
+}
+
+// ---------- 3-a. 참여 기록 (행사 후 Luma '지난(Past)' 탭 복붙) ----------
+// 사전 신청(applications)과 별개 테이블(attendances)에 쌓는다. 취소 동기화는 하지 않는다 —
+// 참여 사실은 나중에 사라질 수 없고, 지난 탭 복붙이 전체 목록이 아닐 수도 있기 때문.
+async function recordAttendances(slackUserId, events) {
+  const studentId = await upsertStudent(slackUserId);
+  let added = 0;
+  for (const ev of events) {
+    const eventId = await upsertEventRow(ev);
+    const ins = await pool.query(
+      `INSERT INTO attendances (student_id, event_id) VALUES ($1,$2)
+       ON CONFLICT (student_id, event_id) DO NOTHING`,
+      [studentId, eventId]
+    );
+    added += ins.rowCount;
+  }
+  return { total: events.length, added };
 }
 
 // ---------- 3-b. 관리자 대시보드 ----------
@@ -297,10 +326,80 @@ async function backfillDisplayNames(client) {
 }
 
 // ---------- 4. DM 수신 → 파싱 → 저장 ----------
+// DM에 'delete'라고만 보내면 복붙 파싱 대신 삭제 피커를 띄운다.
+const DELETE_KEYWORD_RE = /^\s*(delete|del|삭제|delete\s*events?)\s*$/i;
+
+// 본인 기록(참여/신청)을 select 메뉴로 보여준다. 동결 스냅샷(pre_registrations)은 대상이 아니다.
+async function sendDeletePicker(slackUserId, say) {
+  const [att, reg] = await Promise.all([
+    pool.query(
+      `SELECT a.id, e.title,
+              TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+              TO_CHAR(e.event_time, 'HH24:MI')    AS event_time
+       FROM attendances a
+       JOIN events e   ON e.id = a.event_id
+       JOIN students s ON s.id = a.student_id
+       WHERE s.name = $1
+       ORDER BY e.event_date, e.event_time`,
+      [slackUserId]
+    ),
+    pool.query(
+      `SELECT a.id, e.title, a.status,
+              TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+              TO_CHAR(e.event_time, 'HH24:MI')    AS event_time
+       FROM applications a
+       JOIN events e   ON e.id = a.event_id
+       JOIN students s ON s.id = a.student_id
+       WHERE s.name = $1
+       ORDER BY e.event_date, e.event_time`,
+      [slackUserId]
+    ),
+  ]);
+  const blocks = buildDeletePickerBlocks(att.rows, reg.rows);
+  if (!blocks) {
+    await say('Nothing to delete — you have no attendance records or registrations.');
+    return;
+  }
+  await say({ text: 'Pick an event to delete', blocks });
+}
+
+// 피커에서 선택 → 해당 행 삭제. 값은 'att:<id>'/'app:<id>' 형태이고, 소유자(students.name =
+// 누른 사람의 Slack ID)를 함께 검증해 남의 기록을 지울 수 없게 한다.
+app.action('delete_event_pick', async ({ ack, body, action, respond }) => {
+  await ack();
+  try {
+    const [kind, rawId] = String(action.selected_option?.value || '').split(':');
+    const table = kind === 'att' ? 'attendances' : kind === 'app' ? 'applications' : null;
+    if (!table || !/^\d+$/.test(rawId || '')) return;
+    const del = await pool.query(
+      `DELETE FROM ${table} a
+       USING students s, events e
+       WHERE a.id = $1 AND s.id = a.student_id AND s.name = $2 AND e.id = a.event_id
+       RETURNING e.title`,
+      [Number(rawId), body.user.id]
+    );
+    if (!del.rowCount) {
+      // 피커가 이미 지운 항목을 들고 있던 경우(이중 클릭·오래된 메시지)
+      await respond({ text: '⚠️ That record was already removed. Send `delete` again for a fresh list.', replace_original: true });
+      return;
+    }
+    const label = kind === 'att' ? 'attendance record' : 'registration';
+    await respond({ text: `🗑 Removed ${label}: ${del.rows[0].title}\nSend \`delete\` again to remove another.`, replace_original: true });
+  } catch (err) {
+    console.error(err);
+    await respond({ text: '⚠️ Something went wrong while deleting. Please try again.', replace_original: true });
+  }
+});
+
 app.message(async ({ message, say, client }) => {
   if (message.subtype || message.bot_id) return;
   if (message.channel_type !== 'im') return; // DM에서만 반응 (채널 멘션/일반 대화는 무시)
   if (!message.text || !message.text.trim()) return;
+
+  if (DELETE_KEYWORD_RE.test(message.text)) {
+    await sendDeletePicker(message.user, say);
+    return;
+  }
 
   if (message.text.length > MAX_INPUT_LENGTH) {
     await say(`⚠️ That's too long (${message.text.length} characters). Please split it into parts under ${MAX_INPUT_LENGTH} characters.`);
@@ -319,9 +418,41 @@ app.message(async ({ message, say, client }) => {
       console.warn(`skipped ${skip.length} out-of-window event(s):`,
         skip.map((e) => `${e.event_date} ${e.title}`).join(' | '));
     }
+    // 걸러낸 항목은 날짜 오류일 가능성이 높으니 사용자에게 알린다.
+    const skippedNote = skip.length
+      ? `\n⚠️ Skipped ${skip.length} event(s) dated outside TechWeek (${EVENT_WINDOW.from} ~ ${EVENT_WINDOW.to}) — likely a date misread, so not saved:\n`
+        + skip.map((e) => `  · ${e.event_date} — ${e.title}`).join('\n')
+      : '';
+
+    // 모든 날짜가 오늘 이전이면 Luma '지난(Past)' 탭 복붙으로 본다 (예정 탭엔 미래만 나옴).
+    // 이 경우 사전 신청이 아니라 실제 참여 기록으로, 별개 테이블에 저장한다.
+    const today = new Date().toISOString().slice(0, 10);
+    if (isPastPaste(keep, today)) {
+      // 단일 이벤트 복붙(상세 페이지)은 '이거 참여했어'라는 명시적 개별 추가로 보고 상태와
+      // 무관하게 기록한다. 여러 건(지난 탭 목록)일 때만 승인 대기/대기자 등
+      // 실제로 못 간 행사가 섞이므로 'Going'만 참여로 친다.
+      const single = keep.length === 1;
+      const attended = single ? keep : keep.filter((e) => e.status === STATUS_GOING);
+      const notAttended = single ? [] : keep.filter((e) => e.status !== STATUS_GOING);
+      const notAttendedNote = notAttended.length
+        ? `\nℹ️ ${notAttended.length} event(s) weren't marked "Going" on Luma, so not counted as attended:\n`
+          + notAttended.map((e) => `  · ${e.title} (${e.status})`).join('\n')
+        : '';
+      if (!attended.length) {
+        await say(`No attended events found in this paste.${notAttendedNote}${skippedNote}`);
+        return;
+      }
+      const { total, added } = await recordAttendances(message.user, attended);
+      await rememberDisplayName(client, message.user); // 대시보드 표기용 (실패해도 무방)
+      const dupNote = total - added ? ` (${total - added} already recorded)` : '';
+      await say(`🎟 Recorded ${added} attended event(s)!${dupNote}${notAttendedNote}${skippedNote}`);
+      return;
+    }
+
     // 일부가 걸러졌으면 이번 붙여넣기는 불완전하므로 자동 취소 처리를 끈다.
+    // 단일 이벤트(상세 페이지 복붙 = 개별 추가)도 '전체 목록'이 아니므로 취소 처리 대상이 아니다.
     const { saved, removed, removedTitles } = await upsertAll(message.user, keep, {
-      allowCancellation: skip.length === 0,
+      allowCancellation: skip.length === 0 && keep.length > 1,
     });
     await rememberDisplayName(client, message.user); // 대시보드 표기용 (실패해도 무방)
 
@@ -329,11 +460,6 @@ app.message(async ({ message, say, client }) => {
       ? `\n🗑 Removed ${removed} cancelled event(s):\n`
         + removedTitles.map((t) => `  · ${t}`).join('\n')
         + `\nIf that wasn't intended, please copy and send the entire Luma page again.`
-      : '';
-    // 걸러낸 항목은 날짜 오류일 가능성이 높으니 사용자에게 알린다.
-    const skippedNote = skip.length
-      ? `\n⚠️ Skipped ${skip.length} event(s) dated outside TechWeek (${EVENT_WINDOW.from} ~ ${EVENT_WINDOW.to}) — likely a date misread, so not saved:\n`
-        + skip.map((e) => `  · ${e.event_date} — ${e.title}`).join('\n')
       : '';
     await say(`✅ Saved ${saved} event(s)!${removedNote}${skippedNote}`);
   } catch (err) {
@@ -436,11 +562,27 @@ app.command('/my-events', async ({ command, ack, respond }) => {
      ORDER BY e.event_date, e.event_time`,
     [command.user_id]
   );
-  const text = res.rows.length
+  // 참여 기록은 사전 신청과 별개 테이블이라 따로 조회해 섹션을 나눠 보여준다.
+  const att = await pool.query(
+    `SELECT e.title,
+            TO_CHAR(e.event_date, 'YYYY-MM-DD') AS event_date,
+            TO_CHAR(e.event_time, 'HH24:MI')    AS event_time
+     FROM attendances a
+     JOIN events e ON e.id = a.event_id
+     JOIN students s ON s.id = a.student_id
+     WHERE s.name = $1
+     ORDER BY e.event_date, e.event_time`,
+    [command.user_id]
+  );
+  const regText = res.rows.length
     ? `🙋 *My registrations* _(event local time)_\n`
       + res.rows.map((r) => `${fmtWhen(r)} | ${r.title} — ${r.status}`).join('\n')
     : 'No registrations yet.';
-  await respond(text);
+  const attText = att.rows.length
+    ? `\n\n🎟 *Attended* _(event local time)_\n`
+      + att.rows.map((r) => `${fmtWhen(r)} | ${r.title}`).join('\n')
+    : '';
+  await respond(regText + attText);
 });
 
 // ---------- 6. 실행 ----------

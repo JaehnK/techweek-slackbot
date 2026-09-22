@@ -2,7 +2,7 @@
 const assert = require('assert');
 const {
   fmtWhen, weekdaySuffix, buildScheduleText, buildEventStatsText, buildStudentStatsText,
-  dedupKey, partitionByDateWindow, MAX_SLACK_TEXT,
+  dedupKey, partitionByDateWindow, isPastPaste, buildDeletePickerBlocks, MAX_SLACK_TEXT,
 } = require('./format');
 
 let pass = 0;
@@ -390,6 +390,106 @@ check('renderStudents: 스케줄이 없어도(구 시그니처) 깨지지 않고
   const html = renderStudents([{ student_id: 9, label: 'U9', slack_id: 'U9', status: null, cnt: 0, total: 0 }]);
   assert.strictEqual(html.split('U9').length - 1, 1, 'Slack ID 중복 표기');
   assert.ok(html.includes('no registrations'), '0건 표기 없음');
+});
+
+check('renderDashboard: Attendance/Pre-registration 탭이 분리 렌더됨', () => {
+  const html = renderDashboard({
+    summary: { students: 1, events: 1, applications: 1, attendances: 1, snapshotted_at: '2026-08-11 02:28' },
+    eventRows: [], studentRows: [], generatedAt: 'x',
+    attendanceRows: [{
+      event_id: 1, title: 'AI Talk', location: 'Hall', luma_url: null,
+      event_date: '2026-07-27', event_time: '10:00', status: 'Attended', cnt: 2, members: ['Alice', 'Bob'],
+    }],
+    preRegRows: [{
+      event_id: 'ai talk|2026-07-27', title: 'AI Talk', location: null, luma_url: null,
+      event_date: '2026-07-27', event_time: '10:00', status: 'Going', cnt: 1, members: ['Alice'],
+    }],
+  });
+  assert.ok(html.includes('data-tab="attendance"') && html.includes('data-panel="attendance"'), 'Attendance 탭 없음');
+  assert.ok(html.includes('data-tab="prereg"') && html.includes('data-panel="prereg"'), 'Pre-registration 탭 없음');
+  assert.ok(html.includes('Attended 2'), '참여 집계 누락');
+  assert.ok(html.includes('taken 2026-08-11 02:28'), '스냅샷 시각 표기 누락');
+});
+
+check('renderDashboard: 참여/스냅샷 데이터가 없어도(구 시그니처) 빈 안내로 렌더됨', () => {
+  const html = renderDashboard({
+    summary: { students: 0, events: 0, applications: 0 }, eventRows: [], studentRows: [], generatedAt: 'x',
+  });
+  assert.ok(html.includes('No attendance records yet'), '참여 빈 안내 없음');
+  assert.ok(html.includes('No pre-registration snapshot yet'), '스냅샷 빈 안내 없음');
+});
+
+// ---------- 삭제 피커 블록 ----------
+check('buildDeletePickerBlocks: 참여/신청이 그룹으로 나뉘고 값에 종류:id가 실림', () => {
+  const blocks = buildDeletePickerBlocks(
+    [{ id: 7, title: 'AI Talk', event_date: '2026-07-27', event_time: '10:00' }],
+    [{ id: 3, title: 'Robotics', event_date: '2026-07-28', event_time: '09:00', status: 'Going' }],
+  );
+  const select = blocks[0].accessory;
+  assert.strictEqual(select.action_id, 'delete_event_pick');
+  assert.strictEqual(select.option_groups.length, 2, '그룹이 2개가 아님');
+  assert.strictEqual(select.option_groups[0].options[0].value, 'att:7');
+  assert.strictEqual(select.option_groups[1].options[0].value, 'app:3');
+  assert.ok(select.option_groups[1].options[0].text.text.includes('(Going)'), '신청 상태 표기 없음');
+});
+
+check('buildDeletePickerBlocks: 한쪽만 있어도 되고, 둘 다 없으면 null', () => {
+  const only = buildDeletePickerBlocks([], [{ id: 1, title: 'X', event_date: null, event_time: null, status: 'Going' }]);
+  assert.strictEqual(only[0].accessory.option_groups.length, 1);
+  assert.strictEqual(buildDeletePickerBlocks([], []), null);
+});
+
+check('buildDeletePickerBlocks: 긴 제목은 Slack 라벨 제한(75자)에 맞게 잘림', () => {
+  const blocks = buildDeletePickerBlocks(
+    [{ id: 1, title: 'A'.repeat(200), event_date: '2026-07-27', event_time: '10:00' }], [],
+  );
+  const label = blocks[0].accessory.option_groups[0].options[0].text.text;
+  assert.ok(label.length <= 75, `라벨이 ${label.length}자로 제한 초과`);
+  assert.ok(label.endsWith('…'), '말줄임 표기 없음');
+});
+
+// ---------- 지난 행사 복붙 판정 ----------
+check('isPastPaste: 모든 날짜가 오늘 이전이면 지난 탭 복붙', () => {
+  const evs = [{ event_date: '2026-07-27' }, { event_date: '2026-07-29' }];
+  assert.strictEqual(isPastPaste(evs, '2026-08-11'), true);
+});
+
+check('isPastPaste: 오늘 이후 날짜가 하나라도 있으면 예정 탭', () => {
+  const evs = [{ event_date: '2026-07-27' }, { event_date: '2026-08-12' }];
+  assert.strictEqual(isPastPaste(evs, '2026-08-11'), false);
+  // 당일 이벤트도 예정으로 취급 (엄격히 '이전'만 과거)
+  assert.strictEqual(isPastPaste([{ event_date: '2026-08-11' }], '2026-08-11'), false);
+});
+
+check('isPastPaste: 날짜 미정이 섞이거나 비어 있으면 예정 탭으로 보수적 판정', () => {
+  assert.strictEqual(isPastPaste([{ event_date: '2026-07-27' }, { event_date: null }], '2026-08-11'), false);
+  assert.strictEqual(isPastPaste([], '2026-08-11'), false);
+});
+
+check('renderStudents: 참여 기록(Attended)이 칩과 스케줄 태그로 보임', () => {
+  // 참여 기록은 studentRows(신청 집계)에 없고 스케줄 행에 status='Attended'로 합류한다
+  const studentRows = [
+    { student_id: 1, label: 'Alice', slack_id: 'U1', status: 'Going', cnt: 1, total: 1 },
+  ];
+  const studentEventRows = [
+    { student_id: 1, event_date: '2026-07-27', event_time: '10:00', title: 'AI Talk', location: null, luma_url: null, status: 'Going' },
+    { student_id: 1, event_date: '2026-07-27', event_time: '10:00', title: 'AI Talk', location: null, luma_url: null, status: 'Attended' },
+  ];
+  const html = renderStudents(studentRows, studentEventRows);
+  assert.ok(html.includes('st-attended'), 'Attended 색상 클래스 없음');
+  assert.ok(html.includes('Attended 1'), 'Attended 칩(건수) 없음');
+});
+
+check('renderStudents: 신청 0건이어도 참여 기록만 있으면 no registrations로 뭉개지 않음', () => {
+  const studentRows = [
+    { student_id: 2, label: 'Bob', slack_id: 'U2', status: null, cnt: 0, total: 0 },
+  ];
+  const studentEventRows = [
+    { student_id: 2, event_date: '2026-07-28', event_time: '09:00', title: 'Robotics', location: null, luma_url: null, status: 'Attended' },
+  ];
+  const html = renderStudents(studentRows, studentEventRows);
+  assert.ok(html.includes('Attended 1'), 'Attended 칩 없음');
+  assert.ok(!html.includes('no registrations</span></summary>'), '참여만 있는 사람이 no registrations로 표기됨');
 });
 
 // ---------- 미등록 교육생 ----------
